@@ -11,6 +11,9 @@
 #include "common.h"
 #include "fit.h"
 #include "gr00t-input.h"
+#ifdef SERVER_SMOLVLA_ENABLED
+#include "jetson_pi_smolvla.h"
+#endif
 #include "llama.h"
 #include "pi-model.h"
 #include "pi-model-detect.h"
@@ -23,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cctype>
 #include <cmath>
 #include <exception>
 #include <memory>
@@ -30,6 +34,7 @@
 #include <utility>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <cstdlib>
@@ -52,6 +57,7 @@ enum class foreground_policy_kind {
     pi0,
     pi05,
     gr00t_n1d7,
+    smolvla,
 };
 
 static const char * foreground_policy_kind_name(foreground_policy_kind kind) {
@@ -59,6 +65,7 @@ static const char * foreground_policy_kind_name(foreground_policy_kind kind) {
         case foreground_policy_kind::pi0:        return "pi0";
         case foreground_policy_kind::pi05:       return "pi05";
         case foreground_policy_kind::gr00t_n1d7: return "gr00t-n1d7";
+        case foreground_policy_kind::smolvla: return "smolvla";
         case foreground_policy_kind::text:       return "text";
     }
     return "text";
@@ -68,6 +75,7 @@ static foreground_policy_kind server_classify_foreground_policy(const std::strin
     if (architecture == "gr00t-n1d7") {
         return foreground_policy_kind::gr00t_n1d7;
     }
+    if (architecture == "smolvla") return foreground_policy_kind::smolvla;
 
     const pi_model_kind pi_model = pi_model_kind_from_env();
     if (pi_model_kind_is_pi0(pi_model)) {
@@ -99,7 +107,8 @@ static foreground_policy_kind server_detect_foreground_policy(const std::string 
 static bool foreground_policy_uses_default_marker(foreground_policy_kind kind) {
     return kind == foreground_policy_kind::pi0 ||
            kind == foreground_policy_kind::pi05 ||
-           kind == foreground_policy_kind::gr00t_n1d7;
+           kind == foreground_policy_kind::gr00t_n1d7 ||
+           kind == foreground_policy_kind::smolvla;
 }
 
 static uint32_t server_n_outputs_max(const common_params & params) {
@@ -131,12 +140,20 @@ static bool server_set_pi_model_env(pi_model_kind kind) {
 
 static bool server_resolve_pi_model_before_load(const common_params & params) {
     const pi_model_kind env_kind = pi_model_kind_from_env();
+    const pi_model_detect_result model_file = pi_model_detect_gguf_file(params.model.path);
+    if (model_file.general_architecture == "smolvla") {
+        if (env_kind == PI_MODEL_PI0 || env_kind == PI_MODEL_PI05) {
+            SRV_ERR("%s", "SmolVLA cannot be loaded with PI_MODEL=pi0 or pi05; use PI_MODEL=auto\n");
+            return false;
+        }
+        SRV_INF("%s", "detected SmolVLA model; PI_MODEL remains auto\n");
+        return true;
+    }
     if (env_kind == PI_MODEL_PI0 || env_kind == PI_MODEL_PI05) {
         SRV_INF("PI_MODEL=%s explicitly set; skipping GGUF auto-detection\n", pi_model_kind_name(env_kind));
         return true;
     }
 
-    const pi_model_detect_result model_file = pi_model_detect_gguf_file(params.model.path);
     if (model_file.general_architecture == "gr00t-n1d7") {
         SRV_INF("%s", "detected GR00T N1.7 model; PI_MODEL remains auto\n");
         return true;
@@ -1104,6 +1121,9 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
+#ifdef SERVER_SMOLVLA_ENABLED
+    std::unique_ptr<smolvla_policy> smolvla;
+#endif
     const llama_vocab * vocab = nullptr;
 
     server_queue    queue_tasks;
@@ -1182,6 +1202,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+#ifdef SERVER_SMOLVLA_ENABLED
+        smolvla.reset();
+#endif
         spec.reset();
         spec_init.reset();
 
@@ -1884,6 +1907,18 @@ private:
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
+        }
+
+        if (foreground.policy_kind == foreground_policy_kind::smolvla) {
+#ifdef SERVER_SMOLVLA_ENABLED
+            if (!has_mmproj) { SRV_ERR("%s", "SmolVLA requires --mmproj\n"); return false; }
+            std::string smolvla_error;
+            const int threads = std::max(1, params_base.cpuparams.n_threads);
+            smolvla = smolvla_policy::open(params_base.model.path.c_str(), mmproj_path.c_str(), threads, smolvla_error);
+            if (!smolvla) { SRV_ERR("SmolVLA load failed: %s\n", smolvla_error.c_str()); return false; }
+#else
+            SRV_ERR("%s", "SmolVLA requires the CPU backend without dynamic backend loading\n"); return false;
+#endif
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -5688,7 +5723,30 @@ void server_routes::init_routes() {
         }
         std::lock_guard<std::mutex> lock(ctx_server.foreground.mutex);
 
-        if (ctx_server.foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
+        if (ctx_server.foreground.policy_kind == foreground_policy_kind::smolvla) {
+            std::vector<float> state;
+            if (body.at("state").is_array()) {
+                for (const auto & value : body.at("state")) {
+                    if (!value.is_number()) { res->error(format_error_response("SmolVLA state must contain numbers", ERROR_TYPE_INVALID_REQUEST)); return res; }
+                    state.push_back(value.get<float>());
+                }
+            } else if (body.at("state").is_string()) {
+                std::stringstream stream(body.at("state").get<std::string>());
+                std::string item;
+                try {
+                    while (std::getline(stream,item,',')) {
+                        size_t consumed=0; const float value=std::stof(item,&consumed);
+                        while (consumed<item.size() && std::isspace((unsigned char)item[consumed])) ++consumed;
+                        if (consumed!=item.size()) throw std::invalid_argument("invalid state value");
+                        state.push_back(value);
+                    }
+                } catch (const std::exception &) { res->error(format_error_response("invalid SmolVLA state", ERROR_TYPE_INVALID_REQUEST)); return res; }
+            }
+            if (state.size()!=6 || !std::all_of(state.begin(),state.end(),[](float x){return std::isfinite(x);})) {
+                res->error(format_error_response("SmolVLA state must contain six finite normalized numbers", ERROR_TYPE_INVALID_REQUEST)); return res;
+            }
+            ctx_server.foreground.latest_state = std::move(state);
+        } else if (ctx_server.foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
             if (!body.at("state").is_array()) {
                 res->error(format_error_response("GR00T \"state\" must be a JSON number array", ERROR_TYPE_INVALID_REQUEST));
                 return res;
@@ -5779,6 +5837,48 @@ void server_routes::init_routes() {
         const bool compact_response = json_value(body, "compact", false);
 
         std::lock_guard<std::mutex> lock(ctx_server.foreground.mutex);
+        if (ctx_server.foreground.policy_kind == foreground_policy_kind::smolvla) {
+#ifdef SERVER_SMOLVLA_ENABLED
+            if (raw_text.empty() || !ctx_server.foreground.state_flag || ctx_server.foreground.latest_state.size()!=6 ||
+                ctx_server.foreground.bitmaps.entries.size()!=3) {
+                res->error(format_error_response("SmolVLA requires text, six normalized state values and three RGB images", ERROR_TYPE_INVALID_REQUEST)); return res;
+            }
+            std::vector<smolvla_rgb_image> images;
+            for (const auto & bitmap : ctx_server.foreground.bitmaps.entries) {
+                if (!bitmap.ptr || mtmd_bitmap_is_audio(bitmap.ptr.get()) || bitmap.n_bytes() != (size_t)bitmap.nx()*bitmap.ny()*3) {
+                    res->error(format_error_response("SmolVLA requires RGB images", ERROR_TYPE_INVALID_REQUEST)); return res;
+                }
+                images.push_back({bitmap.data(), (int)bitmap.nx(), (int)bitmap.ny()});
+            }
+            std::vector<float> noise(50*32);
+            if (const char * path = std::getenv("SMOLVLA_ACTION_NOISE_BIN")) {
+                std::ifstream file(path,std::ios::binary | std::ios::ate);
+                if (!file || file.tellg() != (std::streamoff)(noise.size()*sizeof(float))) {
+                    res->error(format_error_response("invalid SMOLVLA_ACTION_NOISE_BIN", ERROR_TYPE_SERVER)); return res;
+                }
+                file.seekg(0); file.read(reinterpret_cast<char *>(noise.data()),noise.size()*sizeof(float));
+                if (!file) { res->error(format_error_response("failed to read SmolVLA noise", ERROR_TYPE_SERVER)); return res; }
+            } else {
+                std::mt19937 generator(std::random_device{}()); std::normal_distribution<float> normal(0.0f,1.0f);
+                for (float & value : noise) value=normal(generator);
+            }
+            std::vector<float> action; std::string error;
+            if (!ctx_server.smolvla || !ctx_server.smolvla->infer(images,raw_text,ctx_server.foreground.latest_state,noise,action,error)) {
+                SRV_ERR("SmolVLA inference failed: %s\n",error.c_str());
+                res->error(format_error_response("SmolVLA inference failed", ERROR_TYPE_SERVER)); return res;
+            }
+            json rows=server_context_impl::reshape_gr00t_action_rows(action,50,6);
+            ctx_server.foreground.bitmaps.entries.clear(); ctx_server.foreground.content.clear();
+            res->ok({{"content",""},{"model_family","smolvla"},{"is_action_model",true},{"is_pi0",false},
+                     {"action_normalized",true},{"action_final",rows},{"action_final_raw",rows},
+                     {"action_steps",50},{"action_dim",6},{"n_images",3},
+                     {"state",ctx_server.foreground.latest_state},{"n_past",0},{"history_size",0},
+                     {"timing_breakdown_ms",{{"handler_total_ms",(ggml_time_us()-t_handler_start)/1000.0}}}});
+            return res;
+#else
+            res->error(format_error_response("SmolVLA CPU backend unavailable", ERROR_TYPE_NOT_SUPPORTED)); return res;
+#endif
+        }
         if (ctx_server.foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
             if (raw_text.empty()) {
                 res->error(format_error_response("GR00T \"text\" instruction is required", ERROR_TYPE_INVALID_REQUEST));

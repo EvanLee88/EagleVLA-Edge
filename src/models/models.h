@@ -156,6 +156,13 @@ struct llama_model_llama : public llama_model_base {
 };
 
 
+struct llama_model_smolvla : public llama_model_llama {
+    llama_model_smolvla(const struct llama_model_params & params) : llama_model_llama(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    std::vector<ggml_tensor *> policy_tensors;
+};
+
 struct llama_model_llama4 : public llama_model_base {
     llama_model_llama4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

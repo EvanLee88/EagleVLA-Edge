@@ -444,6 +444,7 @@ class MODEL_ARCH(IntEnum):
     QWEN3VL          = auto()
     QWEN3VLMOE       = auto()
     GR00T_N1D7       = auto()
+    SMOLVLA          = auto()
     QWEN35           = auto()
     QWEN35MOE        = auto()
     PHI2             = auto()
@@ -1037,6 +1038,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN3VL:          "qwen3vl",
     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
     MODEL_ARCH.GR00T_N1D7:       "gr00t-n1d7",
+    MODEL_ARCH.SMOLVLA:          "smolvla",
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
     MODEL_ARCH.PHI2:             "phi2",
@@ -4473,6 +4475,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     ],
     # TODO
 }
+
+MODEL_TENSORS[MODEL_ARCH.SMOLVLA] = MODEL_TENSORS[MODEL_ARCH.LLAMA].copy()
 
 # tensors that will not be serialized
 MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {

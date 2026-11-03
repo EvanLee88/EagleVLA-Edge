@@ -40,6 +40,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
     switch (arch) {
         case LLM_ARCH_LLAMA:
             return new llama_model_llama(params);
+        case LLM_ARCH_SMOLVLA:
+            return new llama_model_smolvla(params);
         case LLM_ARCH_LLAMA4:
             return new llama_model_llama4(params);
         case LLM_ARCH_LLAMA_EMBED:
@@ -1492,7 +1494,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    if (arch == LLM_ARCH_SMOLVLA) {
+        for (const auto & entry : ml.weights_map) {
+            if (entry.first.compare(0, 18, "smolvla.processor.") == 0) {
+                continue;
+            }
+            bool found = false;
+            for (const auto & ctx : ml.ctx_map) {
+                if (ggml_get_tensor(ctx.second.get(), entry.first.c_str())) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw std::runtime_error(format("unconsumed SmolVLA tensor: %s", entry.first.c_str()));
+            }
+        }
+    }
+    ml.done_getting_tensors(arch == LLM_ARCH_SMOLVLA);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -2440,6 +2459,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
         case LLM_ARCH_LLAMA:
+        case LLM_ARCH_SMOLVLA:
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_DECI:

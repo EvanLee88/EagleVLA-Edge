@@ -1,9 +1,11 @@
 # Foreground Server Usage
 
-The foreground server exposes a persistent HTTP session for PI0, PI0.5, and
-GR00T N1.7 robot action inference. Inputs are submitted in stages: images first,
+The foreground server exposes a persistent HTTP session for PI0, PI0.5, GR00T N1.7, and SmolVLA robot action inference. Inputs are submitted in stages: images first,
 then robot state, then instruction text. The final `/foreground/infer` request
 consumes the pending inputs and returns action tensors plus timing information.
+
+For SmolVLA conversion, normalized state/action semantics, and CPU startup, see
+[SmolVLA adaptation and usage](smolvla-adaptation-status.md).
 
 ## Session Model
 

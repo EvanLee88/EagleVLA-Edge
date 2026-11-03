@@ -2728,6 +2728,124 @@ class SmolVLMModel(MmprojModel):
         return [] # skip other tensors
 
 
+def validate_smolvla_cpu_config(policy: dict[str, Any]) -> None:
+    """Reject policy configurations the current SmolVLA CPU runtime cannot execute."""
+    required = {
+        "type": "smolvla", "chunk_size": 50, "max_action_dim": 32, "max_state_dim": 32,
+        "num_vlm_layers": 16, "num_steps": 10, "tokenizer_max_length": 48,
+        "self_attn_every_n_layers": 2, "attention_mode": "cross_attn",
+        "resize_imgs_with_padding": [512, 512], "min_period": 0.004, "max_period": 4.0,
+        "empty_cameras": 0, "adapt_to_pi_aloha": False, "use_delta_joint_actions_aloha": False,
+        "use_cache": True, "add_image_special_tokens": False, "pad_language_to": "max_length",
+        "num_expert_layers": 0, "expert_width_multiplier": 0.75, "prefix_length": 0,
+    }
+    for key, expected in required.items():
+        if policy.get(key) != expected:
+            raise ValueError(f"unsupported SmolVLA {key}: expected {expected!r}, got {policy.get(key)!r}")
+    inputs = policy.get("input_features", {})
+    outputs = policy.get("output_features", {})
+    state = inputs.get("observation.state", {})
+    action = outputs.get("action", {})
+    images = [feature for feature in inputs.values() if feature.get("type") == "VISUAL"]
+    if (state.get("type") != "STATE" or state.get("shape") != [6] or
+        action.get("type") != "ACTION" or action.get("shape") != [6] or
+        len(images) != 3 or any(image.get("shape") != [3, 256, 256] for image in images)):
+        raise ValueError("unsupported SmolVLA features: expected three 3x256x256 images and six state/action values")
+
+
+@ModelBase.register("SmolVLAPolicy")
+class SmolVLAVisionModel(SmolVLMModel):
+    """Export the SmolVLM vision tower embedded in a LeRobot SmolVLA policy."""
+    def __init__(self, *args, **kwargs):
+        policy = dict(kwargs.get("hparams") or ModelBase.load_hparams(args[0], False))
+        backbone_dir = Path(policy["_smolvla_backbone_dir"])
+        with (backbone_dir / "config.json").open(encoding="utf-8") as source:
+            backbone = json.load(source)
+        # Resolve Transformers defaults omitted by the upstream config (e.g. vision layer count).
+        backbone["vision_config"] = AutoConfig.from_pretrained(
+            backbone_dir, local_files_only=True
+        ).vision_config.to_dict()
+        backbone["_preprocessor_config_dir"] = str(backbone_dir)
+        kwargs["hparams"] = backbone
+        super().__init__(*args, **kwargs)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        prefix = "model.vlm_with_expert.vlm."
+        if not name.startswith(prefix):
+            return []
+        return super().modify_tensors(data_torch, name.removeprefix(prefix), bid)
+
+
+@ModelBase.register("SmolVLAPolicy")
+class SmolVLATextModel(LlamaModel):
+    """Export SmolVLA's truncated VLM backbone and policy-specific weights."""
+    model_arch = gguf.MODEL_ARCH.SMOLVLA
+
+    def __init__(self, *args, **kwargs):
+        self.policy_config = dict(kwargs.get("hparams") or ModelBase.load_hparams(args[0], False))
+        self.backbone_dir = Path(self.policy_config["_smolvla_backbone_dir"])
+        with (self.backbone_dir / "config.json").open(encoding="utf-8") as source:
+            backbone = json.load(source)
+        backbone["text_config"]["num_hidden_layers"] = int(self.policy_config["num_vlm_layers"])
+        # SmolVLA's reference applies its own RoPE with max_wavelength=10000,
+        # independently of the underlying SmolVLM text config's rope_theta.
+        backbone["text_config"]["rope_theta"] = 10000.0
+        kwargs["hparams"] = backbone
+        super().__init__(*args, **kwargs)
+        if self.ftype not in (gguf.LlamaFileType.ALL_F32, gguf.LlamaFileType.MOSTLY_F16,
+                              gguf.LlamaFileType.MOSTLY_BF16):
+            raise ValueError("SmolVLA CPU runtime supports only f32, f16 or bf16 output")
+
+    def set_vocab(self):
+        old_dir = self.dir_model
+        self.dir_model = self.backbone_dir
+        try:
+            # SmolVLM2 ships a BPE tokenizer.json, not a SentencePiece model.
+            self._set_vocab_gpt2()
+        finally:
+            self.dir_model = old_dir
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        policy = {k: v for k, v in self.policy_config.items() if not k.startswith("_")}
+        self.gguf_writer.add_string("smolvla.policy_config", json.dumps(policy, ensure_ascii=False))
+        # Missing schema metadata in older files denotes this same tensor layout.
+        self.gguf_writer.add_uint32("smolvla.tensor_schema_version", 1)
+        for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+            path = self.dir_model / name
+            if path.is_file():
+                self.gguf_writer.add_string("smolvla." + name, path.read_text(encoding="utf-8"))
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        from safetensors import safe_open
+        for pipeline_name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+            pipeline_path = self.dir_model / pipeline_name
+            if not pipeline_path.is_file():
+                continue
+            pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+            for step in pipeline.get("steps", []):
+                filename = step.get("state_file")
+                if not filename:
+                    continue
+                if Path(filename).name != filename or not (self.dir_model / filename).is_file():
+                    raise ValueError(f"invalid or missing processor state file: {filename}")
+                with safe_open(self.dir_model / filename, framework="pt", device="cpu") as tensors:
+                    for key in tensors.keys():
+                        yield f"smolvla.processor.{filename}.{key}", tensors.get_tensor(key)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("smolvla.processor."):
+            return [(name, data_torch)]
+        vision_prefix = "model.vlm_with_expert.vlm.model."
+        if name.startswith(vision_prefix + "text_model."):
+            return super().modify_tensors(data_torch, name.removeprefix("model.vlm_with_expert.vlm."), bid)
+        if name.startswith(vision_prefix):
+            return []
+        if name.startswith("model."):
+            return [("smolvla." + name.removeprefix("model."), data_torch)]
+        raise ValueError(f"Unexpected SmolVLA tensor: {name}")
+
+
 @ModelBase.register(
     "Llama4ForConditionalGeneration",
     "Llama4ForCausalLM",
@@ -10574,6 +10692,10 @@ def parse_args() -> argparse.Namespace:
         help="(Experimental) Export multimodal projector (mmproj) for vision models. This will only work on some vision models. A prefix 'mmproj-' will be added to the output file name.",
     )
     parser.add_argument(
+        "--smolvla-backbone", type=Path,
+        help="local SmolVLM2 config, processor and tokenizer snapshot for SmolVLA conversion",
+    )
+    parser.add_argument(
         "--gr00t-cosmos", type=Path,
         help="local nvidia/Cosmos-Reason2-2B snapshot required by GR00T N1.7 conversion",
     )
@@ -10709,6 +10831,12 @@ def main() -> None:
         output_type = ftype_map[args.outtype]
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
+        if hparams.get("type") == "smolvla":
+            validate_smolvla_cpu_config(hparams)
+            if args.smolvla_backbone is None or not args.smolvla_backbone.is_dir():
+                raise ValueError("SmolVLA conversion requires --smolvla-backbone with a local SmolVLM2 snapshot")
+            hparams["_smolvla_backbone_dir"] = str(args.smolvla_backbone.resolve())
+            hparams["architectures"] = ["SmolVLAPolicy"]
         if args.gr00t_cosmos is not None:
             if not args.gr00t_cosmos.is_dir():
                 parser_error = f"--gr00t-cosmos is not a directory: {args.gr00t_cosmos}"

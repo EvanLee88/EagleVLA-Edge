@@ -39,6 +39,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
     { LLM_ARCH_GR00T_N1D7,       "gr00t-n1d7"       },
+    { LLM_ARCH_SMOLVLA,          "smolvla"          },
     { LLM_ARCH_QWEN35,           "qwen35"           },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_PHI2,             "phi2"             },
@@ -376,6 +377,23 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 };
 
 static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+    { LLM_TENSOR_SMOLVLA_ACTION_IN, "smolvla.action_in_proj" },
+    { LLM_TENSOR_SMOLVLA_ACTION_OUT, "smolvla.action_out_proj" },
+    { LLM_TENSOR_SMOLVLA_TIME_IN, "smolvla.action_time_mlp_in" },
+    { LLM_TENSOR_SMOLVLA_TIME_OUT, "smolvla.action_time_mlp_out" },
+    { LLM_TENSOR_SMOLVLA_STATE, "smolvla.state_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_NORM, "smolvla.vlm_with_expert.lm_expert.norm" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_ATTN_NORM, "smolvla.vlm_with_expert.lm_expert.layers.%d.input_layernorm" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_FFN_NORM, "smolvla.vlm_with_expert.lm_expert.layers.%d.post_attention_layernorm" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_Q, "smolvla.vlm_with_expert.lm_expert.layers.%d.self_attn.q_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_K, "smolvla.vlm_with_expert.lm_expert.layers.%d.self_attn.k_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_V, "smolvla.vlm_with_expert.lm_expert.layers.%d.self_attn.v_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_O, "smolvla.vlm_with_expert.lm_expert.layers.%d.self_attn.o_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_GATE, "smolvla.vlm_with_expert.lm_expert.layers.%d.mlp.gate_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_UP, "smolvla.vlm_with_expert.lm_expert.layers.%d.mlp.up_proj" },
+    { LLM_TENSOR_SMOLVLA_EXPERT_DOWN, "smolvla.vlm_with_expert.lm_expert.layers.%d.mlp.down_proj" },
+    { LLM_TENSOR_SMOLVLA_VLM_HEAD, "smolvla.vlm_with_expert.vlm.lm_head" },
+
     { LLM_TENSOR_TOKEN_EMBD,                             "token_embd" },
     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
@@ -661,6 +679,23 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
 // example: https://github.com/ggml-org/llama.cpp/pull/17548
 //
 static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+    { LLM_TENSOR_SMOLVLA_ACTION_IN, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_ACTION_OUT, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_TIME_IN, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_TIME_OUT, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_STATE, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_NORM, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_ATTN_NORM, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_FFN_NORM, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_Q, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_K, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_V, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_O, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_GATE, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_UP, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_EXPERT_DOWN, { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT } },
+    { LLM_TENSOR_SMOLVLA_VLM_HEAD, { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT } },
+
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ACTION_IN,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ACTION_OUT,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},

@@ -30,6 +30,10 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd jetson_pi_gr00t_input ${CMAKE_THREAD_LIBS_INIT})
+if (TARGET jetson_pi_smolvla_policy)
+    target_link_libraries(${TARGET} PUBLIC jetson_pi_smolvla_policy)
+    target_compile_definitions(${TARGET} PRIVATE SERVER_SMOLVLA_ENABLED)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

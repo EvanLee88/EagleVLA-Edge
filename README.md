@@ -23,6 +23,7 @@
     <a href="#real-world-demo">Demo</a> ·
     <a href="#quick-start">Quick Start</a> ·
     <a href="#gr00t-n17-c-api-and-server">GR00T APIs</a> ·
+    <a href="#smolvla-foreground-server-cpu">SmolVLA</a> ·
     <a href="#performance-on-rtx-4090-jetson-orin-and-thor">Performance</a> ·
     <a href="docs/model_conversion.md">Model Conversion</a> ·
     <a href="docs/foreground_server_usage.md">Server API</a> ·
@@ -71,7 +72,8 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 - ✅ **PI0** - PI-specific multimodal preprocessing, language backbone, action expert, and continuous action-chunk generation.
 - ✅ **PI0.5** - two-view prefix construction, PI0.5 prompt/state handling, and 10-step action generation.
 - ✅ **NVIDIA Isaac GR00T N1.7** - Qwen3-VL multimodal backbone, complete GR00T Action Head, four-step flow matching, and `[40, 132]` action generation.
-- ✅ **Automatic model dispatch** - detect PI0, PI0.5, and GR00T N1.7 from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override for PI models.
+- ✅ **SmolVLA** - CPU foreground inference with a SmolVLM2 backbone and continuous `[50, 6]` action chunks for the base checkpoint.
+- ✅ **Automatic model dispatch** - detect PI0, PI0.5, GR00T N1.7, and SmolVLA from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override for PI models.
 
 ### Runtime Optimizations
 
@@ -81,13 +83,13 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 
 ### Interfaces and Deployment
 
-- ✅ **Foreground HTTP server** - persistent PI0, PI0.5, and GR00T image, robot-state, and instruction endpoints with action and timing outputs.
+- ✅ **Foreground HTTP server** - persistent PI0, PI0.5, GR00T, and SmolVLA image, robot-state, and instruction endpoints with action and timing outputs.
 - ✅ **FlashRT provider** - expose the same PI0/PI0.5 GGUF runtime through a C API for the FlashRT Python model interface.
 - ✅ **GR00T C API** - accept raw multi-camera RGB, instruction, normalized state, and embodiment ID through `libjetson_pi_gr00t`.
 
-The foreground HTTP server supports PI0, PI0.5, and GR00T N1.7. The managed Python
-foreground client and FlashRT provider currently remain specific to PI0 and PI0.5;
-GR00T callers can use the HTTP endpoints directly or the standalone C API.
+The foreground HTTP server supports PI0, PI0.5, GR00T N1.7, and SmolVLA.
+SmolVLA uses the CPU path described below. The in-process Python API and FlashRT
+provider remain specific to PI0 and PI0.5; GR00T also has a standalone C API.
 
 ### Planned Model Support
 
@@ -399,6 +401,96 @@ normalized action in `action_final` with `action_steps` and `action_dim`. Image 
 order must match the checkpoint's camera/time convention. The managed Python foreground
 client and FlashRT provider do not yet dispatch GR00T models.
 
+
+## SmolVLA Foreground Server (CPU)
+
+The SmolVLA base checkpoint accepts three camera images, a language instruction,
+**six already normalized state values**, and returns a normalized `[50, 6]` action
+chunk. The current SmolVLA policy implementation runs on the CPU, including on a
+build that also supports GPUs. It uses the existing foreground endpoints and does
+not require a new Web interface.
+
+Build the server with the CPU backend enabled and dynamic backend loading disabled:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CPU=ON -DGGML_BACKEND_DL=OFF
+cmake --build build --target llama-server -j
+```
+
+### Prepare and convert the checkpoint
+
+Install the [conversion dependencies](requirements/requirements-convert_hf_to_gguf.txt)
+with `python3 -m pip install -r requirements/requirements-convert_hf_to_gguf.txt`.
+If the checkpoint is not already local, download it and the SmolVLM2 configuration,
+processor, and tokenizer files. The backbone weights are already included in the
+SmolVLA checkpoint and do not need to be downloaded separately:
+
+```bash
+hf download lerobot/smolvla_base --local-dir /path/to/smolvla_base
+hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+  --include "*.json" --include "*.txt" --local-dir /path/to/SmolVLM2
+```
+
+Use the same local backbone directory for both conversion commands. The output
+folder must exist; F32 is the configuration used in the CPU comparison below:
+
+```bash
+mkdir -p /path/to/smolvla-gguf
+python3 convert_hf_to_gguf.py /path/to/smolvla_base \
+  --smolvla-backbone /path/to/SmolVLM2 \
+  --outfile /path/to/smolvla-gguf/smolvla-main.gguf --outtype f32
+python3 convert_hf_to_gguf.py /path/to/smolvla_base \
+  --mmproj --smolvla-backbone /path/to/SmolVLM2 \
+  --outfile /path/to/smolvla-gguf/mmproj-smolvla.gguf --outtype f32
+```
+
+### Start and call the server
+
+Set `PI_MODEL=auto` or leave it unset; do not force `pi0` or `pi05` for this model.
+Start the existing server with the matching main GGUF and mmproj:
+
+```bash
+PI_MODEL=auto ./build/bin/llama-server \
+  -m /path/to/smolvla-gguf/smolvla-main.gguf \
+  --mmproj /path/to/smolvla-gguf/mmproj-smolvla.gguf \
+  -ngl 0 --host 127.0.0.1 --port 8080 -np 1 -c 1024 -t 4 -tb 4
+```
+
+Submit images in the checkpoint order `camera1`, `camera2`, `camera3`. The `path`
+values refer to files accessible on the server host:
+
+```bash
+curl -X POST http://127.0.0.1:8080/foreground/reset
+curl -X POST http://127.0.0.1:8080/foreground/image \
+  -H 'Content-Type: application/json' -d '{"path":"/path/to/camera1.png"}'
+curl -X POST http://127.0.0.1:8080/foreground/image \
+  -H 'Content-Type: application/json' -d '{"path":"/path/to/camera2.png"}'
+curl -X POST http://127.0.0.1:8080/foreground/image \
+  -H 'Content-Type: application/json' -d '{"path":"/path/to/camera3.png"}'
+curl -X PUT http://127.0.0.1:8080/foreground/state \
+  -H 'Content-Type: application/json' -d '{"state":[0,0,0,0,0,0]}'
+curl -X POST http://127.0.0.1:8080/foreground/infer \
+  -H 'Content-Type: application/json' -d '{"text":"pick up the object"}'
+```
+
+The state can also be a comma-separated string. A successful response identifies
+`model_family` as `smolvla`, sets `action_normalized` to `true`, and returns 50 rows
+of 6 values in `action_final`. Images and pending text are consumed after inference;
+state remains until `/foreground/reset`.
+
+The example state is in normalized model space. Apply the correct dataset/robot
+state normalization before sending observations and action unnormalization before
+using outputs. The supplied base checkpoint does not provide an unambiguous state
+statistics mapping for every robot; do not directly send normalized outputs to a
+robot. By default the server samples random noise. For repeatable comparisons, set
+`SMOLVLA_ACTION_NOISE_BIN` before startup to a file containing exactly `50×32`
+float32 values.
+
+See [SmolVLA conversion and usage](docs/smolvla-adaptation-status.md) for details
+and [CPU HTTP comparison against LeRobot](docs/smolvla-cpu-comparison.md) for
+reproducible accuracy checks.
+
 ## Python API
 
 ### Default: in-process NumPy API
@@ -677,6 +769,8 @@ See the [FlashRT repository](https://github.com/flashrt-project/FlashRT) for ins
 |---|---|
 | [Model Preparation](docs/model_conversion.md) | Download, split, and convert PI checkpoints to GGUF. |
 | [GR00T Validation and Conversion](tools/gr00t-reference/README.md) | Convert GR00T N1.7 to GGUF and run reference and regression utilities. |
+| [SmolVLA Conversion and Usage](docs/smolvla-adaptation-status.md) | Convert SmolVLA and use the CPU foreground server. |
+| [SmolVLA CPU Comparison](docs/smolvla-cpu-comparison.md) | Compare foreground HTTP actions with LeRobot. |
 | [In-process NumPy API](docs/python_api.md) | Direct pybind11 PI0/PI0.5 inference without a server or FlashRT. |
 | [Foreground Server API](docs/foreground_server_usage.md) | Session lifecycle, endpoints, response fields, and operational notes. |
 | [ViT Optimization](latency_optimize_docs/pi0_vit_optimization.md) | Vision graph reuse and input-layout optimization. |

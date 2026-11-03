@@ -1,5 +1,9 @@
 llama_add_compile_flags()
 
+if (TARGET test-smolvla-graph-reuse)
+    add_test(NAME test-smolvla-graph-reuse COMMAND $<TARGET_FILE:test-smolvla-graph-reuse>)
+endif()
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 

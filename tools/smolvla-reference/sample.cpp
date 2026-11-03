@@ -1,0 +1,19 @@
+#include "jetson_pi_smolvla.h"
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <vector>
+static bool read(const char * path, void * data, size_t size) { std::ifstream f(path,std::ios::binary); f.read(static_cast<char *>(data),size); return bool(f); }
+int main(int argc,char **argv) {
+    if(argc!=8) { std::fprintf(stderr,"usage: %s MODEL NOISE KEYS VALUES MASK NTOK OUTPUT\n",argv[0]); return 2; }
+    int n=std::atoi(argv[6]); if(n<1 || n>1024) return 2;
+    std::vector<float> noise(50*32), all_k((size_t)16*n*320), all_v(all_k.size()), output;
+    std::vector<uint8_t> mask(n);
+    if(!read(argv[2],noise.data(),noise.size()*sizeof(float))||!read(argv[3],all_k.data(),all_k.size()*sizeof(float))||!read(argv[4],all_v.data(),all_v.size()*sizeof(float))||!read(argv[5],mask.data(),mask.size())) return 3;
+    std::vector<std::vector<float>> k(16),v(16);
+    for(size_t i=0;i<16;++i) { k[i].assign(all_k.begin()+i*n*320,all_k.begin()+(i+1)*n*320); v[i].assign(all_v.begin()+i*n*320,all_v.begin()+(i+1)*n*320); }
+    std::string error; auto model=smolvla_expert::open(argv[1],4,error);
+    if(!model || !model->sample(noise,k,v,mask,output,error)) { std::fprintf(stderr,"%s\n",error.c_str()); return 4; }
+    std::ofstream f(argv[7],std::ios::binary); f.write(reinterpret_cast<const char *>(output.data()),output.size()*sizeof(float)); return f?0:5;
+}
