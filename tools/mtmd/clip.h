@@ -56,6 +56,10 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    // Optional explicit backend device. Defaults preserve ordinary mtmd selection.
+    ggml_backend_dev_t device = nullptr;
+    // Require all compute and inputs on the requested CUDA device; no CPU fallback.
+    bool strict_device = false;
 };
 
 struct clip_init_result {

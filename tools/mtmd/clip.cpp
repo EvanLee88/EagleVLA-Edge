@@ -162,6 +162,8 @@ struct clip_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_dev_t device = nullptr;
+    bool strict_device = false;
     ggml_backend_buffer_ptr buf;
 
 
@@ -169,6 +171,11 @@ struct clip_ctx {
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
+
+    // One allocated graph in buf_compute_meta. Retain only its metadata context,
+    // never the builder (which holds a reference to the caller's image).
+    ggml_context_ptr vision_reuse_ctx;
+    ggml_cgraph * vision_reuse_graph = nullptr;
 
     bool debug_output_embeddings = false;
 
@@ -182,11 +189,28 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        device = ctx_params.device;
+        strict_device = ctx_params.strict_device;
+        if (strict_device && (!ctx_params.use_gpu || !device ||
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") != 0)) {
+            throw std::runtime_error("strict CLIP execution requires an explicit CUDA device");
+        }
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
+        if (device && (ctx_params.use_gpu || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            if (ggml_backend_get_device(backend_cpu) == device) {
+                backend = backend_cpu;
+            } else {
+                backend = ggml_backend_dev_init(device, nullptr);
+            }
+            if (!backend) {
+                ggml_backend_free(backend_cpu);
+                backend_cpu = nullptr;
+                throw std::runtime_error("failed to initialize explicitly requested CLIP device");
+            }
+        } else if (ctx_params.use_gpu) {
             auto * backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
@@ -200,7 +224,7 @@ struct clip_ctx {
             }
         }
 
-        if (backend) {
+        if (backend && backend != backend_cpu) {
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
             backend_ptrs.push_back(backend);
             backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
@@ -222,6 +246,12 @@ struct clip_ctx {
         sched.reset(
             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
         );
+        if (!sched) {
+            if (backend != backend_cpu) ggml_backend_free(backend);
+            ggml_backend_free(backend_cpu);
+            backend = backend_cpu = nullptr;
+            throw std::runtime_error("failed to create CLIP backend scheduler");
+        }
 
         if (ctx_params.cb_eval != nullptr) {
             ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
@@ -230,7 +260,21 @@ struct clip_ctx {
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
+    void invalidate_vision_reuse() {
+        if (!vision_reuse_ctx) return;
+        // Scheduler state must stop referencing the graph before its metadata
+        // is freed or the shared arena is used to build another graph.
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_reset(sched.get());
+        vision_reuse_graph = nullptr;
+        vision_reuse_ctx.reset();
+    }
+
     ~clip_ctx() {
+        invalidate_vision_reuse();
+        // Scheduler events and buffers must be released while backends live.
+        sched.reset();
+        buf.reset();
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -242,6 +286,42 @@ struct clip_ctx {
         return model.proj_type;
     }
 };
+
+// Pin strict SmolVLA graphs before the scheduler can choose a CPU fallback.
+static void clip_assign_strict_graph(clip_ctx & ctx, ggml_cgraph * graph) {
+    if (!ctx.strict_device) return;
+    std::unordered_set<ggml_tensor *> visited;
+    std::function<void(ggml_tensor *)> assign_inputs = [&](ggml_tensor * tensor) {
+        if (!tensor || !visited.insert(tensor).second) return;
+        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+            ggml_backend_sched_set_tensor_backend(ctx.sched.get(), tensor, ctx.backend);
+        }
+        for (auto * source : tensor->src) assign_inputs(source);
+    };
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        auto * node = ggml_graph_node(graph, i);
+        if (!ggml_backend_supports_op(ctx.backend, node)) {
+            throw std::runtime_error(std::string("strict CLIP CUDA device does not support ") +
+                                     ggml_op_name(node->op) + " (" + node->name + ")");
+        }
+        ggml_backend_sched_set_tensor_backend(ctx.sched.get(), node, ctx.backend);
+        assign_inputs(node);
+    }
+}
+
+static void clip_check_strict_allocation(clip_ctx & ctx, ggml_cgraph * graph) {
+    if (!ctx.strict_device) return;
+    int cuda_nodes = 0, cpu_nodes = 0, other_nodes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        auto * assigned = ggml_backend_sched_get_tensor_backend(ctx.sched.get(), ggml_graph_node(graph, i));
+        if (assigned == ctx.backend) ++cuda_nodes;
+        else if (assigned == ctx.backend_cpu) ++cpu_nodes;
+        else ++other_nodes;
+    }
+    LOG_INF("%s: strict vision allocation device=%s CUDA=%d CPU=%d other=%d\n", __func__,
+            ggml_backend_dev_name(ctx.device), cuda_nodes, cpu_nodes, other_nodes);
+    if (cpu_nodes || other_nodes) throw std::runtime_error("strict CLIP graph was not entirely allocated on CUDA");
+}
 
 //
 // clip_graph
@@ -890,6 +970,8 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 }
 
 static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
+    // Every builder uses the same metadata arena, including warmup/reserve.
+    ctx->invalidate_vision_reuse();
     const clip_image_f32 & img = imgs.entries[0];
     std::unique_ptr<clip_graph> builder;
 
@@ -3017,7 +3099,11 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        if (ctx_clip.strict_device) ggml_backend_sched_reset(ctx_clip.sched.get());
+        clip_assign_strict_graph(ctx_clip, gf);
+        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw std::runtime_error("failed to reserve CLIP graph buffers");
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -3580,6 +3666,16 @@ bool clip_image_encode(struct clip_ctx * ctx, int n_threads, const clip_image_f3
 }
 
 bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32_batch * imgs_c_ptr, std::vector<float> & out_batch_embd) {
+    // Also discard a retained graph on allocation/compute failure or exception
+    // during input upload/readback. Non-reuse paths have nothing to discard.
+    struct reuse_failure_guard {
+        clip_ctx & ctx;
+        bool success = false;
+        ~reuse_failure_guard() {
+            if (!success) ctx.invalidate_vision_reuse();
+        }
+    } reuse_guard{*ctx};
+
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int n_batch_cur = imgs.entries.size();
 
@@ -3589,15 +3685,48 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         return false;
     }
 
-    // if buffers are not allocated, we need to do a warmup run to allocate them
-    if (!ctx->is_allocated) {
-        clip_model_loader::warmup(*ctx, *imgs_c_ptr);
-    }
+    // Qualified default for fixed SmolVLA vision shape/settings. Read per
+    // encode so explicit 0 can select the rebuild comparison on the same handle.
+    const char * reuse_env = std::getenv("SMOLVLA_VISION_REUSE");
+    const bool reuse_enabled = (!reuse_env || std::strcmp(reuse_env, "1") == 0) &&
+        ctx->strict_device && ctx->device && !ctx->no_alloc &&
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ctx->device)), "CUDA") == 0 &&
+        ctx->model.modality == CLIP_MODALITY_VISION &&
+        ctx->proj_type() == PROJECTOR_TYPE_IDEFICS3 &&
+        ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_DISABLED &&
+        !imgs.is_audio && n_batch_cur == 1 &&
+        imgs.entries[0].nx() == 512 && imgs.entries[0].ny() == 512 &&
+        !imgs.entries[0].add_viewsep && !imgs.entries[0].add_newline &&
+        !imgs.entries[0].is_placeholder() &&
+        imgs.entries[0].get_ro_buf().size() == 512u * 512u * 3u;
+    const bool reuse_hit = reuse_enabled && ctx->is_allocated && ctx->vision_reuse_graph;
+    ggml_cgraph * gf = ctx->vision_reuse_graph;
+    if (!reuse_hit) {
+        ctx->invalidate_vision_reuse();
 
-    // build the inference graph
-    ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+        // Preserve lazy warmup and the original build/assign/allocate sequence.
+        if (!ctx->is_allocated) {
+            clip_model_loader::warmup(*ctx, *imgs_c_ptr);
+        }
+        ggml_backend_sched_reset(ctx->sched.get());
+        if (reuse_enabled) {
+            auto builder = clip_get_graph_builder(ctx, imgs);
+            gf = builder->build();
+            ctx->vision_reuse_ctx = std::move(builder->ctx0_ptr);
+            ctx->vision_reuse_graph = gf;
+        } else {
+            gf = clip_get_graph_builder(ctx, imgs)->build();
+        }
+        clip_assign_strict_graph(*ctx, gf);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+            LOG_ERR("%s: failed to allocate CLIP graph\n", __func__);
+            return false;
+        }
+        clip_check_strict_allocation(*ctx, gf);
+        if (reuse_enabled) {
+            LOG_INF("%s: SmolVLA vision graph reuse: allocated cache (512 x 512, batch 1)\n", __func__);
+        }
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -4599,6 +4728,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         LOG_INF("=== END MTMD_DEBUG_EMBEDDINGS ===\n\n");
     }
 
+    reuse_guard.success = true;
     return true;
 }
 

@@ -18,7 +18,11 @@ int main(int argc, char ** argv) {
     input.read(reinterpret_cast<char *>(rgb.data()), rgb.size());
     if (!input) return 3;
     std::string error;
-    auto vision = smolvla_vision::open(argv[1], 4, error);
+    smolvla_backend_options backend;
+    if (!smolvla_backend_options_from_env(backend, error)) {
+        std::fprintf(stderr, "%s\n", error.c_str()); return 2;
+    }
+    auto vision = smolvla_vision::open(argv[1], 4, error, backend);
     if (!vision) { std::fprintf(stderr, "%s\n", error.c_str()); return 4; }
     std::vector<float> result;
     int tokens = 0, dim = 0;

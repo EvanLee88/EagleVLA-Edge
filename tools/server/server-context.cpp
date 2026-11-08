@@ -1913,8 +1913,12 @@ private:
 #ifdef SERVER_SMOLVLA_ENABLED
             if (!has_mmproj) { SRV_ERR("%s", "SmolVLA requires --mmproj\n"); return false; }
             std::string smolvla_error;
+            smolvla_backend_options smolvla_backend;
+            if (!smolvla_backend_options_from_env(smolvla_backend, smolvla_error)) {
+                SRV_ERR("SmolVLA backend configuration failed: %s\n", smolvla_error.c_str()); return false;
+            }
             const int threads = std::max(1, params_base.cpuparams.n_threads);
-            smolvla = smolvla_policy::open(params_base.model.path.c_str(), mmproj_path.c_str(), threads, smolvla_error);
+            smolvla = smolvla_policy::open(params_base.model.path.c_str(), mmproj_path.c_str(), threads, smolvla_error, smolvla_backend);
             if (!smolvla) { SRV_ERR("SmolVLA load failed: %s\n", smolvla_error.c_str()); return false; }
 #else
             SRV_ERR("%s", "SmolVLA requires the CPU backend without dynamic backend loading\n"); return false;
@@ -5863,17 +5867,26 @@ void server_routes::init_routes() {
                 for (float & value : noise) value=normal(generator);
             }
             std::vector<float> action; std::string error;
-            if (!ctx_server.smolvla || !ctx_server.smolvla->infer(images,raw_text,ctx_server.foreground.latest_state,noise,action,error)) {
+            smolvla_policy_timings timings;
+            if (!ctx_server.smolvla || !ctx_server.smolvla->infer(images,raw_text,ctx_server.foreground.latest_state,noise,action,error,&timings)) {
                 SRV_ERR("SmolVLA inference failed: %s\n",error.c_str());
                 res->error(format_error_response("SmolVLA inference failed", ERROR_TYPE_SERVER)); return res;
             }
+            SRV_INF("SmolVLA infer vit_ms=%.3f prefix_prepare_ms=%.3f llm_prefill_ms=%.3f action_expert_ms=%.3f total_ms=%.3f\n",
+                    timings.vit_ms, timings.prefix_prepare_ms, timings.llm_prefill_ms,
+                    timings.action_expert_ms, timings.total_ms);
             json rows=server_context_impl::reshape_gr00t_action_rows(action,50,6);
             ctx_server.foreground.bitmaps.entries.clear(); ctx_server.foreground.content.clear();
             res->ok({{"content",""},{"model_family","smolvla"},{"is_action_model",true},{"is_pi0",false},
                      {"action_normalized",true},{"action_final",rows},{"action_final_raw",rows},
                      {"action_steps",50},{"action_dim",6},{"n_images",3},
                      {"state",ctx_server.foreground.latest_state},{"n_past",0},{"history_size",0},
-                     {"timing_breakdown_ms",{{"handler_total_ms",(ggml_time_us()-t_handler_start)/1000.0}}}});
+                     {"timing_breakdown_ms",{{"vit_ms",timings.vit_ms},
+                                             {"prefix_prepare_ms",timings.prefix_prepare_ms},
+                                             {"llm_prefill_ms",timings.llm_prefill_ms},
+                                             {"action_expert_ms",timings.action_expert_ms},
+                                             {"total_ms",timings.total_ms},
+                                             {"handler_total_ms",(ggml_time_us()-t_handler_start)/1000.0}}}});
             return res;
 #else
             res->error(format_error_response("SmolVLA CPU backend unavailable", ERROR_TYPE_NOT_SUPPORTED)); return res;

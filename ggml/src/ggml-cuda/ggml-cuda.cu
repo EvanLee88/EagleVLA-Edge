@@ -3325,6 +3325,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Adjacent allocating ggml_cast calls only, qualified on NVIDIA CC 8.7.
+    if (node->op == GGML_OP_CPY && node->type == GGML_TYPE_BF16 &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 870 && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * dst = cgraph->nodes[i + 1];
+        const ggml_tensor * src = node->src[0];
+        // ggml_cast has src[1] == self. Its use count therefore includes one
+        // self-reference plus the next cast; use the same view/output/consumer
+        // safety helper as ggml_can_fuse, accounting for this extra reference.
+        if (src && src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            node->src[1] == node && dst->src[1] == dst && dst->src[0] == node &&
+            !dst->view_src && ggml_node_has_n_uses(cgraph, i, 2) &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_CPY }) &&
+            ggml_can_fuse(cgraph, i + 1, { GGML_OP_CPY }) &&
+            ggml_are_same_shape(src, node) && ggml_are_same_shape(node, dst) &&
+            ggml_is_contiguous(src) && ggml_is_contiguous(node) && ggml_is_contiguous(dst)) {
+            // The original two launches tolerate partial source/destination
+            // overlap after allocator reuse; a direct fused launch does not.
+            const uintptr_t src_addr = reinterpret_cast<uintptr_t>(src->data);
+            const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(dst->data);
+            const size_t nbytes = ggml_nbytes(src);
+            if (src_addr != dst_addr &&
+                (src_addr < dst_addr ? dst_addr - src_addr : src_addr - dst_addr) < nbytes) {
+                return 0;
+            }
+            ggml_cuda_cpy_f32_bf16_f32(*cuda_ctx, src, dst);
+            return 1;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;

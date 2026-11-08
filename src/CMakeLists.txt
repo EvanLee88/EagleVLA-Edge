@@ -1,5 +1,19 @@
 llama_add_compile_flags()
 
+option(SMOLVLA_NVTX "Enable NVTX v3 profiling ranges for SmolVLA" OFF)
+if (SMOLVLA_NVTX)
+    # Only discover CUDA for profiling when explicitly requested. NVTX v3 is
+    # header-only; do not link the legacy nvToolsExt library or vendor headers.
+    find_package(CUDAToolkit REQUIRED)
+    find_path(SMOLVLA_NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h
+        HINTS ${CUDAToolkit_INCLUDE_DIRS}
+        NO_DEFAULT_PATH)
+    if (NOT SMOLVLA_NVTX_INCLUDE_DIR)
+        message(FATAL_ERROR "SMOLVLA_NVTX requires installed CUDA toolkit NVTX v3 headers (nvtx3/nvToolsExt.h)")
+    endif()
+    mark_as_advanced(SMOLVLA_NVTX_INCLUDE_DIR)
+endif()
+
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/pi0-build-config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/pi0-build-config.h
@@ -57,6 +71,10 @@ set_target_properties(llama PROPERTIES
 )
 
 target_compile_definitions(llama PRIVATE SMOLVLA_BUILD_TOKENIZER SMOLVLA_BUILD_LLAMA)
+# No separate SmolVLA CUDA switch: match the backend selected for this build.
+if (GGML_CUDA)
+    target_compile_definitions(llama PRIVATE SMOLVLA_DEFAULT_CUDA)
+endif()
 target_include_directories(llama PRIVATE . ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
@@ -207,4 +225,20 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
         ${CMAKE_CURRENT_SOURCE_DIR}/../include/jetson_pi_gr00t.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
+endif()
+
+if (SMOLVLA_NVTX)
+    # models/smolvla.cpp is compiled both by llama and action_input. Apply the
+    # same configuration to every SmolVLA translation unit, not just policy.
+    foreach(target llama jetson_pi_smolvla_input jetson_pi_smolvla_action_input
+                   jetson_pi_smolvla_vision jetson_pi_smolvla_policy)
+        if (TARGET ${target})
+            target_compile_definitions(${target} PRIVATE SMOLVLA_NVTX=1)
+            target_include_directories(${target} SYSTEM PRIVATE ${SMOLVLA_NVTX_INCLUDE_DIR})
+            if (CMAKE_DL_LIBS)
+                # NVTX v3 loads the profiling injection library dynamically.
+                target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+            endif()
+        endif()
+    endforeach()
 endif()

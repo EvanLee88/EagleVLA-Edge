@@ -96,8 +96,11 @@ void llama_model_smolvla::load_arch_tensors(llama_model_loader & ml) {
 #include "jetson_pi_smolvla.h"
 #include "smolvla-model.h"
 
-// SmolVLA CPU graphs use a dedicated ggml backend scheduler. The policy may
-// borrow weights from a llama model; standalone reference tools load their own.
+// SmolVLA graphs retain independent scheduler allocations while sharing a
+// per-thread CPU/CUDA runtime. Weights may be owned or borrowed from llama.
+#include "smolvla-backend.h"
+#include "ggml-alloc.h"
+#include <cstdio>
 
 // action input
 #include "ggml.h"
@@ -118,36 +121,178 @@ namespace {
 constexpr int action_dim = 32, hidden = 720, steps = 50;
 
 // Model-owned tensors are borrowed, never freed or modified here.
-ggml_tensor * borrowed_tensor(const llama_model * model, const std::string & name, int64_t a, int64_t b, std::string & error) {
+ggml_tensor * borrowed_tensor(const llama_model * model, const std::string & name, int64_t a, int64_t b, std::string & error, const smolvla_backend_options & options) {
     const auto * t = smolvla_model_tensor(model, name.c_str());
     if (!t || t->ne[0] != a || t->ne[1] != b || t->ne[2] != 1 || t->ne[3] != 1 ||
         (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
-        !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !t->data) {
-        error = "invalid or non-CPU model tensor: " + name;
+        !t->buffer || !t->data) {
+        error = "invalid or unallocated model tensor: " + name;
+        return nullptr;
+    }
+    auto * device = smolvla_backend_device(options, error);
+    if (!device || !ggml_backend_dev_supports_buft(device, ggml_backend_buffer_get_type(t->buffer))) {
+        error = "SmolVLA weight buffer does not match requested backend: " + name;
         return nullptr;
     }
     return const_cast<ggml_tensor *>(t);
 }
-struct cpu_graph_scheduler {
-    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend{ggml_backend_cpu_init(), ggml_backend_free};
+struct graph_backends {
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu{nullptr, ggml_backend_free};
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cuda{nullptr, ggml_backend_free};
+    std::string error;
+    // Independent handles may be prewarmed together and later used by different
+    // threads. The shared backend's scratch/CUDA context is not reentrant.
+    std::mutex mutex;
+    graph_backends(int threads, const smolvla_backend_options & options) {
+        auto * device = smolvla_backend_device(options, error);
+        if (!device) return;
+        cpu.reset(ggml_backend_cpu_init());
+        if (!cpu) { error = "cannot initialize SmolVLA CPU backend"; return; }
+        ggml_backend_cpu_set_n_threads(cpu.get(), threads);
+        if (options.backend == smolvla_backend::cuda) {
+            cuda.reset(ggml_backend_dev_init(device, nullptr));
+            if (!cuda) error = "cannot initialize SmolVLA CUDA device: " + options.device;
+        }
+    }
+    ggml_backend_t primary() const { return cuda ? cuda.get() : cpu.get(); }
+};
+std::shared_ptr<graph_backends> acquire_backends(int threads, const smolvla_backend_options & options) {
+    using key_type = std::tuple<int, smolvla_backend, std::string>;
+    static thread_local std::map<key_type, std::weak_ptr<graph_backends>> cache;
+    const key_type key{threads, options.backend, options.backend == smolvla_backend::cuda ? options.device : ""};
+    for (auto it = cache.begin(); it != cache.end();) {
+        if (it->second.expired()) it = cache.erase(it); else ++it;
+    }
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        if (auto result = it->second.lock()) return result;
+    }
+    auto result = std::make_shared<graph_backends>(threads, options);
+    if (result->error.empty()) cache[key] = result;
+    return result;
+}
+struct graph_scheduler {
+    std::shared_ptr<graph_backends> backends;
     std::unique_ptr<ggml_backend_sched, decltype(&ggml_backend_sched_free)> sched{nullptr, ggml_backend_sched_free};
-    explicit cpu_graph_scheduler(int threads) {
-        if (!backend) return;
-        ggml_backend_cpu_set_n_threads(backend.get(), threads);
-        ggml_backend_t backends[] = {backend.get()};
-        sched.reset(ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false));
+    graph_scheduler(int threads, const smolvla_backend_options & options, size_t graph_size = GGML_DEFAULT_GRAPH_SIZE) : backends(acquire_backends(threads, options)) {
+        if (!backends->error.empty()) {
+            std::fprintf(stderr, "SmolVLA backend error: %s\n", backends->error.c_str());
+            return;
+        }
+        ggml_backend_t devices[] = {backends->cuda.get(), backends->cpu.get()};
+        sched.reset(ggml_backend_sched_new(devices + (backends->cuda ? 0 : 1), nullptr,
+                                          backends->cuda ? 2 : 1, graph_size, false, false));
+    }
+    ~graph_scheduler() {
+        std::lock_guard<std::mutex> lock(backends->mutex);
+        sched.reset();
+    }
+    ggml_status compute(ggml_cgraph * graph) {
+        std::lock_guard<std::mutex> lock(backends->mutex);
+        return ggml_backend_sched_graph_compute(sched.get(), graph);
+    }
+    bool allocate(ggml_cgraph * graph) {
+        std::lock_guard<std::mutex> lock(backends->mutex);
+        if (!sched) return false;
+        auto * gpu = backends->cuda.get();
+        if (gpu) {
+            // Strict CUDA: explicitly place every operation and dynamic input.
+            // Unsupported operators fail rather than silently compute on CPU.
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                auto * node = ggml_graph_node(graph, i);
+                if (!ggml_backend_supports_op(gpu, node)) {
+                    std::fprintf(stderr, "SmolVLA CUDA unsupported op %s (%s)\n", ggml_op_name(node->op), node->name);
+                    return false;
+                }
+                ggml_backend_sched_set_tensor_backend(sched.get(), node, gpu);
+                for (auto * src : node->src) {
+                    if (src && !src->buffer && (src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), src, gpu);
+                    }
+                }
+            }
+        }
+        if (!ggml_backend_sched_alloc_graph(sched.get(), graph)) return false;
+        int compute = 0, cuda_compute = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            auto * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
+                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
+            ++compute;
+            if (gpu && ggml_backend_sched_get_tensor_backend(sched.get(), node) == gpu) ++cuda_compute;
+        }
+        std::fprintf(stderr, "SmolVLA graph placement: backend=%s compute_nodes=%d cuda_nodes=%d cpu_nodes=%d splits=%d\n",
+                     ggml_backend_name(backends->primary()), compute, cuda_compute, compute - cuda_compute,
+                     ggml_backend_sched_get_n_splits(sched.get()));
+        return !gpu || compute == cuda_compute;
     }
 };
+using weight_buffer = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
+bool load_weight_buffer(ggml_context * ctx, gguf_context * file, std::ifstream & source,
+                        const std::vector<std::pair<ggml_tensor *, int64_t>> & tensors,
+                        graph_backends & runtime, weight_buffer & buffer, std::string & error) {
+    if (!runtime.error.empty()) { error = runtime.error; return false; }
+    buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, runtime.primary()));
+    if (!buffer) { error = "cannot allocate SmolVLA backend weights"; return false; }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (const auto & entry : tensors) {
+        const size_t offset = gguf_get_data_offset(file) + gguf_get_tensor_offset(file, entry.second);
+        if (offset > (size_t) std::numeric_limits<std::streamoff>::max()) { error = "invalid weight offset"; return false; }
+        std::vector<char> bytes(ggml_nbytes(entry.first));
+        source.seekg((std::streamoff) offset);
+        source.read(bytes.data(), bytes.size());
+        if (!source) { error = std::string("cannot read SmolVLA tensor: ") + entry.first->name; return false; }
+        ggml_backend_tensor_set(entry.first, bytes.data(), 0, bytes.size());
+    }
+    return true;
+}
+ggml_tensor * vector_weight(ggml_context * ctx, ggml_tensor * weight) {
+    // CUDA elementwise ADD/MUL do not accept BF16 operands. Preserve values
+    // exactly in F32; activation BF16 round trips remain part of the graph.
+    return weight->type == GGML_TYPE_BF16 ? ggml_cast(ctx, weight, GGML_TYPE_F32) : weight;
+}
+// Shared projection formulas keep staged and complete-step rounding identical.
+ggml_tensor * build_action_encode(ggml_context * ctx, ggml_tensor * const * weights,
+                                  ggml_tensor * actions, ggml_tensor * time) {
+    auto linear = [&](ggml_tensor * input, int index) {
+        return ggml_add(ctx, ggml_mul_mat(ctx, weights[index], input), vector_weight(ctx, weights[index + 1]));
+    };
+    auto * projected = linear(actions, 0);
+    return linear(ggml_silu(ctx, linear(ggml_concat(ctx, projected, time, 0), 2)), 4);
+}
+ggml_tensor * build_expert_norm(ggml_context * ctx, ggml_tensor * const * weights, ggml_tensor * input) {
+    auto * norm = ggml_rms_norm(ctx, input, 1e-5f);
+    norm = ggml_cast(ctx, ggml_cast(ctx, norm, GGML_TYPE_BF16), GGML_TYPE_F32);
+    auto * result = ggml_mul(ctx, norm, vector_weight(ctx, weights[10]));
+    return ggml_cast(ctx, ggml_cast(ctx, result, GGML_TYPE_BF16), GGML_TYPE_F32);
+}
+ggml_tensor * build_velocity_projection(ggml_context * ctx, ggml_tensor * const * weights, ggml_tensor * input) {
+    return ggml_add(ctx, ggml_mul_mat(ctx, weights[6], input), vector_weight(ctx, weights[7]));
+}
+std::vector<float> action_time_values(float time) {
+    // Preserve host double trig and the original F32 conversion, not device trig.
+    std::vector<float> values(hidden * steps);
+    for (int d = 0; d < hidden / 2; ++d) {
+        const double fraction = (double) d / (hidden / 2 - 1);
+        const double period = 0.004 * std::pow(4.0 / 0.004, fraction);
+        const double phase = (2.0 * 3.14159265358979323846 / period) * (double) time;
+        for (int j = 0; j < steps; ++j) {
+            values[j * hidden + d] = (float) std::sin(phase);
+            values[j * hidden + d + hidden / 2] = (float) std::cos(phase);
+        }
+    }
+    return values;
+}
 // The scheduler must outlive its allocated tensors, and be destroyed before
 // their metadata context and the borrowed or owned model weights.
 struct reusable_graph {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{ggml_init({1024 * 1024, nullptr, true}), ggml_free};
-    cpu_graph_scheduler runtime;
+    graph_scheduler runtime;
     ggml_cgraph * graph = nullptr;
     ggml_tensor * inputs[3] = {};
     ggml_tensor * outputs[3] = {};
     size_t shape = 0;
-    explicit reusable_graph(int threads) : runtime(threads) {}
+    reusable_graph(int threads, const smolvla_backend_options & options) : runtime(threads, options) {}
 };
 struct tensor_spec { const char * name; int64_t a, b; };
 constexpr tensor_spec specs[] = {
@@ -169,13 +314,16 @@ struct smolvla_action_input::impl {
     ggml_context * weights = nullptr;
     ggml_tensor * tensors[11] = {};
     int threads = 1;
+    smolvla_backend_options backend;
+    std::shared_ptr<graph_backends> execution;
+    weight_buffer buffer{nullptr, ggml_backend_buffer_free};
     std::unique_ptr<reusable_graph> graphs[4];
-    ~impl() { for (auto & graph : graphs) graph.reset(); if (weights) ggml_free(weights); }
+    ~impl() { for (auto & graph : graphs) graph.reset(); buffer.reset(); if (weights) ggml_free(weights); }
 };
 smolvla_action_input::smolvla_action_input() : state(new impl) {}
 smolvla_action_input::~smolvla_action_input() = default;
 
-std::unique_ptr<smolvla_action_input> smolvla_action_input::open(const char * path, int threads, std::string & error) {
+std::unique_ptr<smolvla_action_input> smolvla_action_input::open(const char * path, int threads, std::string & error, const smolvla_backend_options & backend) {
     error.clear();
     if (!path || !*path || threads <= 0) { error = "invalid action input configuration"; return nullptr; }
     ggml_context * header_ctx = nullptr;
@@ -216,34 +364,40 @@ std::unique_ptr<smolvla_action_input> smolvla_action_input::open(const char * pa
             error = std::string("invalid action tensor: ") + specs[i].name;
             return nullptr;
         }
-        bytes += ggml_nbytes(t) + ggml_tensor_overhead() + 64;
+        bytes += ggml_tensor_overhead() + 64;
     }
     auto result = std::unique_ptr<smolvla_action_input>(new smolvla_action_input);
     result->state->threads = threads;
-    result->state->weights = ggml_init({bytes, nullptr, false});
+    result->state->backend = backend;
+    result->state->execution = acquire_backends(threads, backend);
+    if (!result->state->execution->error.empty()) { error = result->state->execution->error; return nullptr; }
+    result->state->weights = ggml_init({bytes, nullptr, true});
     if (!result->state->weights) { error = "cannot allocate action weights"; return nullptr; }
     std::ifstream source(path, std::ios::binary);
     if (!source) { error = "cannot open action GGUF"; return nullptr; }
+    std::vector<std::pair<ggml_tensor *, int64_t>> loading;
     for (size_t i = 0; i < 11; ++i) {
         auto * meta = ggml_get_tensor(header.get(), specs[i].name);
         auto * dst = ggml_new_tensor(result->state->weights, meta->type, 2, meta->ne);
         result->state->tensors[i] = dst;
-        const size_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), ids[i]);
-        if (offset > (size_t) std::numeric_limits<std::streamoff>::max()) { error = "invalid tensor offset"; return nullptr; }
-        source.seekg((std::streamoff) offset);
-        source.read(static_cast<char *>(dst->data), ggml_nbytes(dst));
-        if (!source) { error = std::string("cannot read action tensor: ") + specs[i].name; return nullptr; }
+        ggml_set_name(dst, specs[i].name);
+        loading.emplace_back(dst, ids[i]);
     }
+    if (!load_weight_buffer(result->state->weights, file.get(), source, loading,
+                            *result->state->execution, result->state->buffer, error)) return nullptr;
     return result;
 }
 
-std::unique_ptr<smolvla_action_input> smolvla_action_input::open(const llama_model * model, int threads, std::string & error) {
+std::unique_ptr<smolvla_action_input> smolvla_action_input::open(const llama_model * model, int threads, std::string & error, const smolvla_backend_options & backend) {
     error.clear();
     if (!model || threads <= 0) { error = "invalid action input configuration"; return nullptr; }
     auto result = std::unique_ptr<smolvla_action_input>(new smolvla_action_input);
     result->state->threads = threads;
+    result->state->backend = backend;
+    result->state->execution = acquire_backends(threads, backend);
+    if (!result->state->execution->error.empty()) { error = result->state->execution->error; return nullptr; }
     for (size_t i = 0; i < 11; ++i) {
-        result->state->tensors[i] = borrowed_tensor(model, specs[i].name, specs[i].a, specs[i].b, error);
+        result->state->tensors[i] = borrowed_tensor(model, specs[i].name, specs[i].a, specs[i].b, error, backend);
         if (!result->state->tensors[i]) return nullptr;
     }
     return result;
@@ -254,26 +408,21 @@ bool smolvla_action_input::encode(const float * noisy_actions, float time, std::
     if (!noisy_actions || !std::isfinite(time) || time < 0 || time > 1) { error = "invalid action input or time"; return false; }
     for (int i = 0; i < steps * action_dim; ++i) if (!std::isfinite(noisy_actions[i])) { error = "non-finite action input"; return false; }
     if (!state->graphs[0]) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate action graph"; return false; }
         if (!runtime.sched) { error = "cannot initialize action scheduler"; return false; }
         auto * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, action_dim, steps);
         ggml_set_input(x);
-        auto linear = [&](ggml_tensor * input, int index) {
-            return ggml_add(ctx.get(), ggml_mul_mat(ctx.get(), state->tensors[index], input), state->tensors[index + 1]);
-        };
-        auto * projected = linear(x, 0);
         auto * time_embedding = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden, steps);
         ggml_set_input(time_embedding);
-        auto * combined = ggml_concat(ctx.get(), projected, time_embedding, 0);
-        auto * result = linear(ggml_silu(ctx.get(), linear(combined, 2)), 4);
+        auto * result = build_action_encode(ctx.get(), state->tensors, x, time_embedding);
         ggml_set_output(result);
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate action scheduler graph"; return false; }
+        if (!runtime.allocate(graph)) { error = "cannot allocate action scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->inputs[1] = time_embedding;
         candidate->outputs[0] = result;
@@ -285,21 +434,11 @@ bool smolvla_action_input::encode(const float * noisy_actions, float time, std::
     auto * x = cached.inputs[0];
     auto * time_embedding = cached.inputs[1];
     auto * result = cached.outputs[0];
-    std::vector<float> time_values(hidden * steps);
-    float * values = time_values.data();
-    for (int d = 0; d < hidden / 2; ++d) {
-        const double fraction = (double) d / (hidden / 2 - 1);
-        const double period = 0.004 * std::pow(4.0 / 0.004, fraction);
-        const double phase = (2.0 * 3.14159265358979323846 / period) * (double) time;
-        for (int j = 0; j < steps; ++j) {
-            values[j * hidden + d] = (float) std::sin(phase);
-            values[j * hidden + d + hidden / 2] = (float) std::cos(phase);
-        }
-    }
+    const auto time_values = action_time_values(time);
 
     ggml_backend_tensor_set(x, noisy_actions, 0, steps * action_dim * sizeof(float));
     ggml_backend_tensor_set(time_embedding, time_values.data(), 0, time_values.size() * sizeof(float));
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) {
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) {
         state->graphs[0].reset(); error = "action graph computation failed"; return false;
     }
     output.resize(steps * hidden);
@@ -315,19 +454,19 @@ bool smolvla_action_input::project_velocity(const float * expert_output, std::ve
         if (!std::isfinite(expert_output[i])) { error = "non-finite expert output"; return false; }
     }
     if (!state->graphs[1]) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate velocity graph"; return false; }
         if (!runtime.sched) { error = "cannot initialize velocity scheduler"; return false; }
         auto * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden, steps);
         ggml_set_input(x);
-        auto * result = ggml_add(ctx.get(), ggml_mul_mat(ctx.get(), state->tensors[6], x), state->tensors[7]);
+        auto * result = build_velocity_projection(ctx.get(), state->tensors, x);
         ggml_set_output(result);
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate velocity scheduler graph"; return false; }
+        if (!runtime.allocate(graph)) { error = "cannot allocate velocity scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->outputs[0] = result;
         state->graphs[1] = std::move(candidate);
@@ -339,7 +478,7 @@ bool smolvla_action_input::project_velocity(const float * expert_output, std::ve
     auto * result = cached.outputs[0];
 
     ggml_backend_tensor_set(x, expert_output, 0, steps * hidden * sizeof(float));
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) {
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) {
         state->graphs[1].reset(); error = "velocity graph computation failed"; return false;
     }
     velocity.resize(steps * action_dim);
@@ -355,19 +494,19 @@ bool smolvla_action_input::project_state(const float * state_input, std::vector<
         if (!std::isfinite(state_input[i])) { error = "non-finite state input"; return false; }
     }
     if (!state->graphs[2]) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate state graph"; return false; }
         if (!runtime.sched) { error = "cannot initialize state scheduler"; return false; }
         auto * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 32, 1);
         ggml_set_input(x);
-        auto * result = ggml_add(ctx.get(), ggml_mul_mat(ctx.get(), state->tensors[8], x), state->tensors[9]);
+        auto * result = ggml_add(ctx.get(), ggml_mul_mat(ctx.get(), state->tensors[8], x), vector_weight(ctx.get(), state->tensors[9]));
         ggml_set_output(result);
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate state scheduler graph"; return false; }
+        if (!runtime.allocate(graph)) { error = "cannot allocate state scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->outputs[0] = result;
         state->graphs[2] = std::move(candidate);
@@ -379,7 +518,7 @@ bool smolvla_action_input::project_state(const float * state_input, std::vector<
     auto * result = cached.outputs[0];
 
     ggml_backend_tensor_set(x, state_input, 0, 32 * sizeof(float));
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) {
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) {
         state->graphs[2].reset(); error = "state graph computation failed"; return false;
     }
     embedding.resize(960);
@@ -395,24 +534,20 @@ bool smolvla_action_input::normalize_expert(const float * expert_hidden, std::ve
         if (!std::isfinite(expert_hidden[i])) { error = "non-finite expert hidden state"; return false; }
     }
     if (!state->graphs[3]) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate expert norm graph"; return false; }
         if (!runtime.sched) { error = "cannot initialize expert norm scheduler"; return false; }
         auto * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden, steps);
         ggml_set_input(x);
-        auto * norm = ggml_rms_norm(ctx.get(), x, 1e-5f);
-        // LlamaRMSNorm casts the normalized activation back to the input dtype
-        // before multiplying by its BF16 weight. Both operations round to BF16.
-        norm = ggml_cast(ctx.get(), ggml_cast(ctx.get(), norm, GGML_TYPE_BF16), GGML_TYPE_F32);
-        auto * result = ggml_mul(ctx.get(), norm, state->tensors[10]);
-        result = ggml_cast(ctx.get(), ggml_cast(ctx.get(), result, GGML_TYPE_BF16), GGML_TYPE_F32);
+        // Preserve both explicit LlamaRMSNorm BF16 rounding points.
+        auto * result = build_expert_norm(ctx.get(), state->tensors, x);
         ggml_set_output(result);
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate expert norm scheduler graph"; return false; }
+        if (!runtime.allocate(graph)) { error = "cannot allocate expert norm scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->outputs[0] = result;
         state->graphs[3] = std::move(candidate);
@@ -424,7 +559,7 @@ bool smolvla_action_input::normalize_expert(const float * expert_hidden, std::ve
     auto * result = cached.outputs[0];
 
     ggml_backend_tensor_set(x, expert_hidden, 0, steps * hidden * sizeof(float));
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) {
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) {
         state->graphs[3].reset(); error = "expert norm graph computation failed"; return false;
     }
     output.resize(steps * hidden);
@@ -448,11 +583,11 @@ struct rope_graph {
     size_t tokens, heads;
     int threads;
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, ggml_free};
-    cpu_graph_scheduler runtime;
+    graph_scheduler runtime;
     ggml_tensor * x = nullptr, * positions = nullptr, * result = nullptr;
     ggml_cgraph * graph = nullptr;
 
-    rope_graph(size_t n, size_t h, int n_threads) : tokens(n), heads(h), threads(n_threads), runtime(n_threads) {
+    rope_graph(size_t n, size_t h, int n_threads, const smolvla_backend_options & options) : tokens(n), heads(h), threads(n_threads), runtime(n_threads, options) {
         ctx.reset(ggml_init({1024 * 1024, nullptr, true}));
         if (!ctx || !runtime.sched) return;
         x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 64, heads, tokens);
@@ -463,14 +598,14 @@ struct rope_graph {
         ggml_set_output(result);
         graph = ggml_new_graph(ctx.get());
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) graph = nullptr;
+        if (!runtime.allocate(graph)) graph = nullptr;
     }
 };
 }
 
 namespace smolvla {
 bool expert_rope(const float * input, size_t tokens, size_t heads, const int32_t * positions,
-                 int threads, std::vector<float> & output, std::string & error) {
+                 int threads, std::vector<float> & output, std::string & error, const smolvla_backend_options & backend) {
     output.clear(); error.clear();
     if (!input || !positions || !tokens || tokens > 8192 || !heads || heads > 64 || threads <= 0) {
         error = "invalid RoPE input"; return false;
@@ -479,20 +614,20 @@ bool expert_rope(const float * input, size_t tokens, size_t heads, const int32_t
     for (size_t i = 0; i < count; ++i) {
         if (!std::isfinite(input[i])) { error = "non-finite RoPE input"; return false; }
     }
-    using key_type = std::tuple<size_t, size_t, int>;
+    using key_type = std::tuple<size_t, size_t, int, smolvla_backend, std::string>;
     static thread_local std::map<key_type, std::unique_ptr<rope_graph>> cache;
-    const key_type key{tokens, heads, threads};
+    const key_type key{tokens, heads, threads, backend.backend, backend.device};
     auto it = cache.find(key);
     if (it == cache.end()) {
         if (cache.size() >= 8) cache.clear();
-        auto entry = std::make_unique<rope_graph>(tokens, heads, threads);
-        if (!entry->graph) { error = "cannot allocate RoPE scheduler graph"; return false; }
+        auto entry = std::make_unique<rope_graph>(tokens, heads, threads, backend);
+        if (!entry->graph) { error = entry->runtime.backends->error.empty() ? "cannot allocate RoPE scheduler graph" : entry->runtime.backends->error; return false; }
         it = cache.emplace(key, std::move(entry)).first;
     }
     auto & entry = *it->second;
     ggml_backend_tensor_set(entry.x, input, 0, count * sizeof(float));
     ggml_backend_tensor_set(entry.positions, positions, 0, tokens * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(entry.runtime.sched.get(), entry.graph) != GGML_STATUS_SUCCESS) {
+    if (entry.runtime.compute(entry.graph) != GGML_STATUS_SUCCESS) {
         cache.erase(it); error = "RoPE graph failed"; return false;
     }
     output.resize(count);
@@ -513,11 +648,11 @@ bool expert_rope(const float * input, size_t tokens, size_t heads, const int32_t
 namespace {
 struct attention_graph {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, ggml_free};
-    cpu_graph_scheduler runtime;
+    graph_scheduler runtime;
     ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * mask = nullptr, * result = nullptr;
     ggml_cgraph * graph = nullptr;
 
-    attention_graph(size_t nq, size_t nk, int threads, bool round_probs) : runtime(threads) {
+    attention_graph(size_t nq, size_t nk, int threads, bool round_probs, const smolvla_backend_options & options) : runtime(threads, options) {
         ctx.reset(ggml_init({1024 * 1024, nullptr, true}));
         if (!ctx || !runtime.sched) return;
         q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 64, 15, nq);
@@ -536,14 +671,14 @@ struct attention_graph {
         ggml_set_output(result);
         graph = ggml_new_graph(ctx.get());
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) graph = nullptr;
+        if (!runtime.allocate(graph)) graph = nullptr;
     }
 };
 }
 
 namespace smolvla {
 bool attention(const float * query, const float * key, const float * value, size_t nq, size_t nk,
-               const uint8_t * mask, int threads, std::vector<float> & output, std::string & error, bool bf16_probabilities) {
+               const uint8_t * mask, int threads, std::vector<float> & output, std::string & error, bool bf16_probabilities, const smolvla_backend_options & backend) {
     output.clear(); error.clear();
     if (!query || !key || !value || !mask || !nq || !nk || nq > 1024 || nk > 1024 || threads <= 0) {
         error = "invalid attention input"; return false;
@@ -551,14 +686,14 @@ bool attention(const float * query, const float * key, const float * value, size
     for (size_t i = 0; i < nq * 15 * 64; ++i) if (!std::isfinite(query[i])) { error = "invalid query"; return false; }
     for (size_t i = 0; i < nk * 5 * 64; ++i) if (!std::isfinite(key[i]) || !std::isfinite(value[i])) { error = "invalid key/value"; return false; }
     for (size_t i = 0; i < nq * nk; ++i) if (mask[i] > 1) { error = "invalid attention mask"; return false; }
-    using key_type = std::tuple<size_t, size_t, int, bool>;
+    using key_type = std::tuple<size_t, size_t, int, bool, smolvla_backend, std::string>;
     static thread_local std::map<key_type, std::unique_ptr<attention_graph>> cache;
-    const key_type cache_key{nq, nk, threads, bf16_probabilities};
+    const key_type cache_key{nq, nk, threads, bf16_probabilities, backend.backend, backend.device};
     auto it = cache.find(cache_key);
     if (it == cache.end()) {
         if (cache.size() >= 4) cache.clear();
-        auto entry = std::make_unique<attention_graph>(nq, nk, threads, bf16_probabilities);
-        if (!entry->graph) { error = "cannot allocate attention scheduler graph"; return false; }
+        auto entry = std::make_unique<attention_graph>(nq, nk, threads, bf16_probabilities, backend);
+        if (!entry->graph) { error = entry->runtime.backends->error.empty() ? "cannot allocate attention scheduler graph" : entry->runtime.backends->error; return false; }
         it = cache.emplace(cache_key, std::move(entry)).first;
     }
     auto & entry = *it->second;
@@ -576,7 +711,7 @@ bool attention(const float * query, const float * key, const float * value, size
     ggml_backend_tensor_set(entry.k, expanded_k.data(), 0, expanded_k.size() * sizeof(float));
     ggml_backend_tensor_set(entry.v, expanded_v.data(), 0, expanded_v.size() * sizeof(float));
     ggml_backend_tensor_set(entry.mask, attention_mask.data(), 0, attention_mask.size() * sizeof(float));
-    if (ggml_backend_sched_graph_compute(entry.runtime.sched.get(), entry.graph) != GGML_STATUS_SUCCESS) {
+    if (entry.runtime.compute(entry.graph) != GGML_STATUS_SUCCESS) {
         cache.erase(it); error = "attention graph failed"; return false;
     }
     output.resize(nq * 15 * 64);
@@ -587,6 +722,8 @@ bool attention(const float * query, const float * key, const float * value, size
 
 
 // expert mlp
+#include "../smolvla-profile.h"
+#include <cstdlib>
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
@@ -596,6 +733,44 @@ bool attention(const float * query, const float * key, const float * value, size
 #include <limits>
 #include <memory>
 
+// Explicitly passed only by sample(); cached values cannot outlive the request.
+// Persistent graph caches below retain allocations, not reusable request values.
+struct smolvla_expert_mlp::sample_workspace {
+    std::vector<uint8_t> self_mask, cross_mask;
+    std::vector<int32_t> self_positions, cross_positions;
+    std::vector<float> projected_k[16], projected_v[16];
+    std::vector<float> q, k, v, rotated_q, rotated_k, full_k, full_v, attention;
+    std::vector<float> suffix, hidden, next, normalized;
+    // CUDA resident graphs; input validity belongs to this request, not
+    // to the persistent allocation or a recycled workspace address.
+    bool resident = false;
+    bool resident_uploaded[16] = {};
+    std::vector<float> self_float_mask, cross_float_mask;
+};
+
+namespace {
+struct resident_expert_inputs {
+    ggml_tensor * hidden = nullptr, * prefix_k = nullptr, * prefix_v = nullptr;
+    ggml_tensor * positions = nullptr, * mask = nullptr;
+    ggml_tensor * result = nullptr, * validation = nullptr;
+};
+struct resident_expert_graph : resident_expert_inputs {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx;
+    graph_scheduler runtime;
+    ggml_cgraph * graph = nullptr;
+    size_t prefix_tokens = 0;
+    resident_expert_graph(int threads, const smolvla_backend_options & options, bool chain = false)
+        : ctx(ggml_init({size_t(chain ? 16 : 1) * 1024 * 1024, nullptr, true}), ggml_free),
+          runtime(threads, options, chain ? 16384 : GGML_DEFAULT_GRAPH_SIZE) {}
+};
+struct resident_expert_chain {
+    resident_expert_graph combined;
+    resident_expert_inputs layers[16];
+    ggml_tensor * actions = nullptr, * time = nullptr;
+    resident_expert_chain(int threads, const smolvla_backend_options & options) : combined(threads, options, true) {}
+};
+}
+
 struct smolvla_expert_mlp::impl {
     ggml_context * weights = nullptr;
     ggml_tensor * gate = nullptr, * up = nullptr, * down = nullptr, * attn_out = nullptr, * post_norm = nullptr;
@@ -603,13 +778,18 @@ struct smolvla_expert_mlp::impl {
     bool cross = false;
     int layer = 0;
     int threads = 1;
-    std::unique_ptr<reusable_graph> graphs[3];
-    ~impl() { for (auto & graph : graphs) graph.reset(); if (weights) ggml_free(weights); }
+    smolvla_backend_options backend;
+    std::shared_ptr<graph_backends> execution;
+    weight_buffer buffer{nullptr, ggml_backend_buffer_free};
+    // MLP, residual, standalone QKV, sample cross-KV, sample cross-Q.
+    std::unique_ptr<reusable_graph> graphs[5];
+    std::unique_ptr<resident_expert_graph> resident;
+    ~impl() { resident.reset(); for (auto & graph : graphs) graph.reset(); buffer.reset(); if (weights) ggml_free(weights); }
 };
 smolvla_expert_mlp::smolvla_expert_mlp() : state(new impl) {}
 smolvla_expert_mlp::~smolvla_expert_mlp() = default;
 
-std::unique_ptr<smolvla_expert_mlp> smolvla_expert_mlp::open(const char * path, int layer, int threads, std::string & error) {
+std::unique_ptr<smolvla_expert_mlp> smolvla_expert_mlp::open(const char * path, int layer, int threads, std::string & error, const smolvla_backend_options & backend) {
     error.clear();
     if (!path || !*path || layer < 0 || layer >= 16 || threads <= 0) { error = "invalid expert MLP configuration"; return nullptr; }
     ggml_context * header_ptr = nullptr;
@@ -632,34 +812,40 @@ std::unique_ptr<smolvla_expert_mlp> smolvla_expert_mlp::open(const char * path, 
             t->ne[2] != 1 || t->ne[3] != 1 || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
             error = "invalid expert MLP tensor: " + names[i]; return nullptr;
         }
-        bytes += ggml_nbytes(t) + ggml_tensor_overhead() + 64;
+        bytes += ggml_tensor_overhead() + 64;
     }
     auto result = std::unique_ptr<smolvla_expert_mlp>(new smolvla_expert_mlp);
     result->state->threads = threads;
+    result->state->backend = backend;
+    result->state->execution = acquire_backends(threads, backend);
+    if (!result->state->execution->error.empty()) { error = result->state->execution->error; return nullptr; }
     result->state->cross = layer % 2 != 0;
     result->state->layer = layer;
-    result->state->weights = ggml_init({bytes, nullptr, false});
+    result->state->weights = ggml_init({bytes, nullptr, true});
     if (!result->state->weights) { error = "cannot allocate expert MLP weights"; return nullptr; }
     std::ifstream source(path, std::ios::binary);
     if (!source) { error = "cannot open GGUF"; return nullptr; }
+    std::vector<std::pair<ggml_tensor *, int64_t>> loading;
     ggml_tensor ** destinations[] = {&result->state->gate, &result->state->up, &result->state->down, &result->state->attn_out, &result->state->post_norm, &result->state->input_norm, &result->state->q, &result->state->k, &result->state->v};
     for (int i = 0; i < 9; ++i) {
         auto * meta = ggml_get_tensor(header.get(), names[i].c_str());
         *destinations[i] = ggml_new_tensor(result->state->weights, meta->type, 2, meta->ne);
-        const size_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), ids[i]);
-        if (offset > (size_t) std::numeric_limits<std::streamoff>::max()) { error = "invalid GGUF tensor offset"; return nullptr; }
-        source.seekg((std::streamoff) offset);
-        source.read(static_cast<char *>((*destinations[i])->data), ggml_nbytes(*destinations[i]));
-        if (!source) { error = "cannot read expert MLP tensor"; return nullptr; }
+        ggml_set_name(*destinations[i], names[i].c_str());
+        loading.emplace_back(*destinations[i], ids[i]);
     }
+    if (!load_weight_buffer(result->state->weights, file.get(), source, loading,
+                            *result->state->execution, result->state->buffer, error)) return nullptr;
     return result;
 }
 
-std::unique_ptr<smolvla_expert_mlp> smolvla_expert_mlp::open(const llama_model * model, int layer, int threads, std::string & error) {
+std::unique_ptr<smolvla_expert_mlp> smolvla_expert_mlp::open(const llama_model * model, int layer, int threads, std::string & error, const smolvla_backend_options & backend) {
     error.clear();
     if (!model || layer < 0 || layer >= 16 || threads <= 0) { error = "invalid expert MLP configuration"; return nullptr; }
     auto result = std::unique_ptr<smolvla_expert_mlp>(new smolvla_expert_mlp);
     result->state->threads = threads;
+    result->state->backend = backend;
+    result->state->execution = acquire_backends(threads, backend);
+    if (!result->state->execution->error.empty()) { error = result->state->execution->error; return nullptr; }
     result->state->cross = layer % 2 != 0;
     result->state->layer = layer;
     const std::string base = "smolvla.vlm_with_expert.lm_expert.layers." + std::to_string(layer) + ".";
@@ -668,7 +854,7 @@ std::unique_ptr<smolvla_expert_mlp> smolvla_expert_mlp::open(const llama_model *
     const int64_t b[] = {2048, 2048, 720, 720, 1, 1, 960, 320, 320};
     ggml_tensor ** dst[] = {&result->state->gate, &result->state->up, &result->state->down, &result->state->attn_out, &result->state->post_norm, &result->state->input_norm, &result->state->q, &result->state->k, &result->state->v};
     for (int i = 0; i < 9; ++i) {
-        *dst[i] = borrowed_tensor(model, base + names[i], a[i], b[i], error);
+        *dst[i] = borrowed_tensor(model, base + names[i], a[i], b[i], error, backend);
         if (!*dst[i]) return nullptr;
     }
     return result;
@@ -679,7 +865,7 @@ bool smolvla_expert_mlp::run(const float * input, std::vector<float> & output, s
     if (!input) { error = "missing expert MLP input"; return false; }
     for (int i = 0; i < 50 * 720; ++i) if (!std::isfinite(input[i])) { error = "non-finite expert MLP input"; return false; }
     if (!state->graphs[0]) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate expert MLP graph"; return false; }
@@ -696,7 +882,7 @@ bool smolvla_expert_mlp::run(const float * input, std::vector<float> & output, s
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate expert MLP scheduler graph"; return false; }
+        if (!runtime.allocate(graph)) { error = "cannot allocate expert MLP scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->outputs[0] = result;
         state->graphs[0] = std::move(candidate);
@@ -708,7 +894,7 @@ bool smolvla_expert_mlp::run(const float * input, std::vector<float> & output, s
     auto * result = cached.outputs[0];
 
     ggml_backend_tensor_set(x, input, 0, 50 * 720 * sizeof(float));
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) { state->graphs[0].reset(); error = "expert MLP graph failed"; return false; }
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) { state->graphs[0].reset(); error = "expert MLP graph failed"; return false; }
     output.resize(50 * 720);
     ggml_backend_tensor_get(result, output.data(), 0, output.size() * sizeof(float));
     return true;
@@ -721,7 +907,7 @@ bool smolvla_expert_mlp::finish_layer(const float * hidden, const float * attent
     for (int i = 0; i < 50 * 720; ++i) if (!std::isfinite(hidden[i])) { error = "non-finite expert hidden state"; return false; }
     for (int i = 0; i < 50 * 960; ++i) if (!std::isfinite(attention[i])) { error = "non-finite attention output"; return false; }
     if (!state->graphs[1]) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate expert layer graph"; return false; }
@@ -736,7 +922,7 @@ bool smolvla_expert_mlp::finish_layer(const float * hidden, const float * attent
         a = round_bf16(a);
         auto * residual = round_bf16(ggml_add(ctx.get(), round_bf16(ggml_mul_mat(ctx.get(), state->attn_out, a)), x));
         auto * norm = round_bf16(ggml_rms_norm(ctx.get(), residual, 1e-5f));
-        norm = round_bf16(ggml_mul(ctx.get(), norm, state->post_norm));
+        norm = round_bf16(ggml_mul(ctx.get(), norm, vector_weight(ctx.get(), state->post_norm)));
         auto * gate = round_bf16(ggml_mul_mat(ctx.get(), state->gate, norm));
         auto * up = round_bf16(ggml_mul_mat(ctx.get(), state->up, norm));
         auto * intermediate = round_bf16(ggml_mul(ctx.get(), round_bf16(ggml_silu(ctx.get(), gate)), up));
@@ -746,7 +932,7 @@ bool smolvla_expert_mlp::finish_layer(const float * hidden, const float * attent
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
         ggml_build_forward_expand(graph, result);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate expert layer scheduler graph"; return false; }
+        if (!runtime.allocate(graph)) { error = "cannot allocate expert layer scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->inputs[1] = attention_input;
         candidate->outputs[0] = result;
@@ -761,7 +947,7 @@ bool smolvla_expert_mlp::finish_layer(const float * hidden, const float * attent
 
     ggml_backend_tensor_set(x, hidden, 0, 50 * 720 * sizeof(float));
     ggml_backend_tensor_set(attention_input, attention, 0, 50 * 960 * sizeof(float));
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) { state->graphs[1].reset(); error = "expert layer graph failed"; return false; }
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) { state->graphs[1].reset(); error = "expert layer graph failed"; return false; }
     output.resize(50 * 720);
     ggml_backend_tensor_get(result, output.data(), 0, output.size() * sizeof(float));
     return true;
@@ -771,6 +957,50 @@ bool smolvla_expert_mlp::finish_layer(const float * hidden, const float * attent
 bool smolvla_expert_mlp::project_qkv(const float * hidden, const float * cache_k, const float * cache_v,
                                      size_t cache_tokens, std::vector<float> & q, std::vector<float> & k,
                                      std::vector<float> & v, std::string & error) {
+    return project_qkv_impl(hidden, cache_k, cache_v, cache_tokens, q, k, v, error, nullptr);
+}
+
+bool smolvla_expert_mlp::prepare_cross_kv(const float * cache_k, const float * cache_v, size_t tokens,
+                                         sample_workspace & workspace, std::string & error) {
+    if (!cache_k || !cache_v || !tokens || tokens > 1024) { error = "invalid expert QKV input"; return false; }
+    for (size_t i = 0; i < tokens * 320; ++i) {
+        if (!std::isfinite(cache_k[i]) || !std::isfinite(cache_v[i])) { error = "non-finite prefix cache"; return false; }
+    }
+    if (!state->graphs[3] || state->graphs[3]->shape != tokens) {
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
+        auto * ctx = candidate->ctx.get();
+        if (!ctx) { error = "cannot allocate expert KV graph"; return false; }
+        if (!candidate->runtime.sched) { error = "cannot initialize expert KV scheduler"; return false; }
+        for (int i = 0; i < 2; ++i) {
+            candidate->inputs[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 320, tokens);
+            ggml_set_input(candidate->inputs[i]);
+            // Cross projections have always returned F32: do not add BF16 casts.
+            candidate->outputs[i] = ggml_mul_mat(ctx, i ? state->v : state->k, candidate->inputs[i]);
+            ggml_set_output(candidate->outputs[i]);
+        }
+        candidate->graph = ggml_new_graph(ctx);
+        for (int i = 0; i < 2; ++i) ggml_build_forward_expand(candidate->graph, candidate->outputs[i]);
+        if (!candidate->runtime.allocate(candidate->graph)) { error = "cannot allocate expert KV scheduler graph"; return false; }
+        candidate->shape = tokens;
+        state->graphs[3] = std::move(candidate);
+    }
+    auto & graph = *state->graphs[3];
+    ggml_backend_tensor_set(graph.inputs[0], cache_k, 0, tokens * 320 * sizeof(float));
+    ggml_backend_tensor_set(graph.inputs[1], cache_v, 0, tokens * 320 * sizeof(float));
+    if (graph.runtime.compute(graph.graph) != GGML_STATUS_SUCCESS) {
+        state->graphs[3].reset(); error = "expert KV graph failed"; return false;
+    }
+    auto & k = workspace.projected_k[state->layer];
+    auto & v = workspace.projected_v[state->layer];
+    k.resize(tokens * 320); v.resize(tokens * 320);
+    ggml_backend_tensor_get(graph.outputs[0], k.data(), 0, k.size() * sizeof(float));
+    ggml_backend_tensor_get(graph.outputs[1], v.data(), 0, v.size() * sizeof(float));
+    return true;
+}
+
+bool smolvla_expert_mlp::project_qkv_impl(const float * hidden, const float * cache_k, const float * cache_v,
+                                        size_t cache_tokens, std::vector<float> & q, std::vector<float> & k,
+                                        std::vector<float> & v, std::string & error, sample_workspace * workspace) {
     q.clear(); k.clear(); v.clear(); error.clear();
     if (!hidden || (state->cross && (!cache_k || !cache_v || !cache_tokens || cache_tokens > 1024))) {
         error = "invalid expert QKV input"; return false;
@@ -780,8 +1010,10 @@ bool smolvla_expert_mlp::project_qkv(const float * hidden, const float * cache_k
     if (state->cross) for (size_t i = 0; i < kv_tokens * 320; ++i) {
         if (!std::isfinite(cache_k[i]) || !std::isfinite(cache_v[i])) { error = "non-finite prefix cache"; return false; }
     }
-    if (!state->graphs[2] || state->graphs[2]->shape != kv_tokens) {
-        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads));
+    const bool query_only = workspace && state->cross;
+    const int graph_index = query_only ? 4 : 2;
+    if (!state->graphs[graph_index] || state->graphs[graph_index]->shape != kv_tokens) {
+        auto candidate = std::unique_ptr<reusable_graph>(new reusable_graph(state->threads, state->backend));
         auto & ctx = candidate->ctx;
         auto & runtime = candidate->runtime;
         if (!ctx) { error = "cannot allocate expert QKV graph"; return false; }
@@ -793,22 +1025,24 @@ bool smolvla_expert_mlp::project_qkv(const float * hidden, const float * cache_k
         // F32 suffix embeddings; later layers receive BF16 hidden states.
         auto * norm = ggml_rms_norm(ctx.get(), x, 1e-5f);
         if (state->layer != 0) norm = round_bf16(norm);
-        auto * n = round_bf16(ggml_mul(ctx.get(), norm, state->input_norm));
+        auto * n = round_bf16(ggml_mul(ctx.get(), norm, vector_weight(ctx.get(), state->input_norm)));
         auto * query = round_bf16(ggml_mul_mat(ctx.get(), state->q, n));
         ggml_tensor * ki = n, * vi = n;
-        if (state->cross) {
+        if (state->cross && !query_only) {
             ki = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 320, kv_tokens);
             vi = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 320, kv_tokens);
             ggml_set_input(ki); ggml_set_input(vi);
         }
-        auto * keys = ggml_mul_mat(ctx.get(), state->k, ki);
-        auto * values = ggml_mul_mat(ctx.get(), state->v, vi);
+        auto * keys = query_only ? nullptr : ggml_mul_mat(ctx.get(), state->k, ki);
+        auto * values = query_only ? nullptr : ggml_mul_mat(ctx.get(), state->v, vi);
         if (!state->cross) { keys = round_bf16(keys); values = round_bf16(values); }
-        ggml_set_output(query); ggml_set_output(keys); ggml_set_output(values);
+        ggml_set_output(query);
+        if (!query_only) { ggml_set_output(keys); ggml_set_output(values); }
         auto * graph = ggml_new_graph(ctx.get());
         candidate->graph = graph;
-        ggml_build_forward_expand(graph, query); ggml_build_forward_expand(graph, keys); ggml_build_forward_expand(graph, values);
-        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), graph)) { error = "cannot allocate expert QKV scheduler graph"; return false; }
+        ggml_build_forward_expand(graph, query);
+        if (!query_only) { ggml_build_forward_expand(graph, keys); ggml_build_forward_expand(graph, values); }
+        if (!runtime.allocate(graph)) { error = "cannot allocate expert QKV scheduler graph"; return false; }
         candidate->inputs[0] = x;
         candidate->inputs[1] = ki;
         candidate->inputs[2] = vi;
@@ -816,9 +1050,9 @@ bool smolvla_expert_mlp::project_qkv(const float * hidden, const float * cache_k
         candidate->outputs[1] = keys;
         candidate->outputs[2] = values;
         candidate->shape = kv_tokens;
-        state->graphs[2] = std::move(candidate);
+        state->graphs[graph_index] = std::move(candidate);
     }
-    auto & cached = *state->graphs[2];
+    auto & cached = *state->graphs[graph_index];
     auto & runtime = cached.runtime;
     auto * graph = cached.graph;
     auto * x = cached.inputs[0];
@@ -829,51 +1063,226 @@ bool smolvla_expert_mlp::project_qkv(const float * hidden, const float * cache_k
     auto * values = cached.outputs[2];
 
     ggml_backend_tensor_set(x, hidden, 0, 50 * 720 * sizeof(float));
-    if (state->cross) {
+    if (state->cross && !query_only) {
         ggml_backend_tensor_set(ki, cache_k, 0, kv_tokens * 320 * sizeof(float));
         ggml_backend_tensor_set(vi, cache_v, 0, kv_tokens * 320 * sizeof(float));
     }
-    if (ggml_backend_sched_graph_compute(runtime.sched.get(), graph) != GGML_STATUS_SUCCESS) { state->graphs[2].reset(); error = "expert QKV graph failed"; return false; }
-    q.resize(50 * 960); k.resize(kv_tokens * 320); v.resize(kv_tokens * 320);
+    if (runtime.compute(graph) != GGML_STATUS_SUCCESS) { state->graphs[graph_index].reset(); error = "expert QKV graph failed"; return false; }
+    q.resize(50 * 960);
     ggml_backend_tensor_get(query, q.data(), 0, q.size() * sizeof(float));
-    ggml_backend_tensor_get(keys, k.data(), 0, k.size() * sizeof(float));
-    ggml_backend_tensor_get(values, v.data(), 0, v.size() * sizeof(float));
+    if (!query_only) {
+        k.resize(kv_tokens * 320); v.resize(kv_tokens * 320);
+        ggml_backend_tensor_get(keys, k.data(), 0, k.size() * sizeof(float));
+        ggml_backend_tensor_get(values, v.data(), 0, v.size() * sizeof(float));
+    }
     return true;
 }
 
 
+namespace {
+// One formula for both the single-layer comparison and the full layer chain.
+// Layer is inferred so the private implementation type stays private.
+template<class Layer>
+void build_resident_expert_layer(ggml_context * ctx, resident_expert_inputs * candidate,
+                                 Layer * state, ggml_tensor * hidden, size_t prefix_tokens, bool chain = false) {
+    const size_t kv_tokens = state->cross ? prefix_tokens : prefix_tokens + 50;
+    auto retain = [](ggml_tensor * t) {
+        // Preserve staged graph boundaries in this combined graph. Keeping
+        // only a reshape/permute view is insufficient: its allocation root
+        // must also be protected from gallocr reuse/in-place consumers.
+        // These tensors stay on device; there is no extra host readback.
+        ggml_set_output(t);
+        while (t->view_src) { t = t->view_src; ggml_set_output(t); }
+    };
+    candidate->hidden = hidden;
+    candidate->prefix_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 5, prefix_tokens);
+    candidate->prefix_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 5, prefix_tokens);
+    candidate->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 50);
+    candidate->mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv_tokens, 50);
+    for (auto * input : {candidate->prefix_k, candidate->prefix_v, candidate->positions, candidate->mask}) ggml_set_input(input);
+    // INPUT alone does not prevent gallocr freeing/reusing storage after
+    // the last consumer. These values are uploaded once per request, so
+    // protect them as outputs across all ten graph computes (no readback).
+    for (auto * input : {candidate->prefix_k, candidate->prefix_v, candidate->positions, candidate->mask}) ggml_set_output(input);
+    auto round = [&](ggml_tensor * t) { return ggml_cast(ctx, ggml_cast(ctx, t, GGML_TYPE_BF16), GGML_TYPE_F32); };
+    auto rope = [&](ggml_tensor * t, int64_t heads) {
+        t = ggml_reshape_3d(ctx, t, 64, heads, 50);
+        return round(ggml_rope_ext(ctx, t, candidate->positions, nullptr, 64, GGML_ROPE_TYPE_NEOX,
+                                  0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f));
+    };
+    // Separate diagnostic branches: finite entries become exact zero,
+    // NaN/Inf become NaN. CUDA SCALE uses runtime scale*x+bias without a
+    // zero-scale shortcut; SUM propagates the poison. The aggregate alone
+    // is read back, and never feeds the model. Keep this output explicit.
+    auto validate = [&](ggml_tensor * t) {
+        auto * probe = ggml_sum(ctx, ggml_scale(ctx, t, 0.0f));
+        candidate->validation = candidate->validation ? ggml_add(ctx, candidate->validation, probe) : probe;
+    };
+    // The host loop previously checked every layer input and final norm input.
+    if (chain) validate(candidate->hidden);
+    auto * norm = ggml_rms_norm(ctx, candidate->hidden, 1e-5f);
+    if (state->layer != 0) norm = round(norm);
+    norm = round(ggml_mul(ctx, norm, vector_weight(ctx, state->input_norm)));
+    auto * q = round(ggml_mul_mat(ctx, state->q, norm));
+    retain(q);
+    validate(q); // expert_rope's input validation
+    q = rope(q, 15);
+    retain(q);
+    validate(q); // attention's query validation
+    auto * k = candidate->prefix_k;
+    auto * v = candidate->prefix_v;
+    if (state->cross) { retain(k); retain(v); }
+    if (!state->cross) {
+        auto * suffix_k = round(ggml_mul_mat(ctx, state->k, norm));
+        auto * suffix_v = round(ggml_mul_mat(ctx, state->v, norm));
+        retain(suffix_k); retain(suffix_v);
+        validate(suffix_k);
+        suffix_k = rope(suffix_k, 5);
+        retain(suffix_k);
+        suffix_v = ggml_reshape_3d(ctx, suffix_v, 64, 5, 50);
+        k = ggml_concat(ctx, k, suffix_k, 2);
+        v = ggml_concat(ctx, v, suffix_v, 2);
+    }
+    validate(k); validate(v); // original attention's finite K/V checks
+    auto expand_gqa = [&](ggml_tensor * t) {
+        // [64,1,5,tokens] -> [64,3,5,tokens] gives adjacent triples
+        // (head h reads KV head h/3), not modulo-5 head broadcasting.
+        t = ggml_reshape_4d(ctx, t, 64, 1, 5, kv_tokens);
+        t = ggml_repeat_4d(ctx, t, 64, 3, 5, kv_tokens);
+        return ggml_reshape_3d(ctx, t, 64, 15, kv_tokens);
+    };
+    k = expand_gqa(k); v = expand_gqa(v);
+    retain(k); retain(v);
+    auto * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
+    auto * kp = ggml_permute(ctx, k, 0, 2, 1, 3);
+    auto * vp = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+    auto * scores = ggml_mul_mat(ctx, kp, qp);
+    auto * probabilities = ggml_soft_max_ext(ctx, scores, candidate->mask, 0.125f, 0.0f);
+    if (!state->cross) probabilities = round(probabilities);
+    auto * attention = ggml_mul_mat(ctx, vp, probabilities);
+    attention = ggml_cont_2d(ctx, ggml_permute(ctx, attention, 0, 2, 1, 3), 960, 50);
+    if (!state->cross) attention = round(attention);
+    retain(attention);
+    validate(attention); // finish_layer's input validation
+    // Keep finish_layer's complete explicit BF16 rounding sequence.
+    attention = round(attention);
+    auto * residual = round(ggml_add(ctx, round(ggml_mul_mat(ctx, state->attn_out, attention)), candidate->hidden));
+    norm = round(ggml_rms_norm(ctx, residual, 1e-5f));
+    norm = round(ggml_mul(ctx, norm, vector_weight(ctx, state->post_norm)));
+    auto * gate = round(ggml_mul_mat(ctx, state->gate, norm));
+    auto * up = round(ggml_mul_mat(ctx, state->up, norm));
+    auto * intermediate = round(ggml_mul(ctx, round(ggml_silu(ctx, gate)), up));
+    auto * mlp = round(ggml_mul_mat(ctx, state->down, intermediate));
+    candidate->result = round(ggml_add(ctx, mlp, residual));
+    if (chain && state->layer == 15) validate(candidate->result);
+    ggml_set_output(candidate->result); ggml_set_output(candidate->validation);
+}
+}
+
+bool smolvla_expert_mlp::forward_resident(const float * hidden, const float * prefix_k, const float * prefix_v,
+                                          size_t prefix_tokens, std::vector<float> & output,
+                                          std::string & error, sample_workspace & workspace) {
+    SMOLVLA_PROFILE_SCOPE_ID("smolvla.expert.resident_layer", state->layer);
+    output.clear(); error.clear();
+    const size_t kv_tokens = state->cross ? prefix_tokens : prefix_tokens + 50;
+    if (!hidden || !prefix_k || !prefix_v || !prefix_tokens || kv_tokens > 1024) {
+        error = "invalid attention input"; return false;
+    }
+    for (size_t i = 0; i < 50 * 720; ++i) if (!std::isfinite(hidden[i])) {
+        error = "non-finite expert hidden state"; return false;
+    }
+    const float * static_k = state->cross ? workspace.projected_k[state->layer].data() : prefix_k;
+    const float * static_v = state->cross ? workspace.projected_v[state->layer].data() : prefix_v;
+    if (!state->resident || state->resident->prefix_tokens != prefix_tokens) {
+        auto candidate = std::unique_ptr<resident_expert_graph>(new resident_expert_graph(state->threads, state->backend));
+        auto * ctx = candidate->ctx.get();
+        if (!ctx) { error = "cannot allocate resident expert graph"; return false; }
+        if (!candidate->runtime.sched) { error = "cannot initialize resident expert scheduler"; return false; }
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 720, 50);
+        ggml_set_input(input);
+        build_resident_expert_layer(ctx, candidate.get(), state.get(), input, prefix_tokens);
+        candidate->graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(candidate->graph, candidate->result);
+        ggml_build_forward_expand(candidate->graph, candidate->validation);
+        if (!candidate->runtime.allocate(candidate->graph)) { error = "cannot allocate resident expert scheduler graph"; return false; }
+        candidate->prefix_tokens = prefix_tokens;
+        std::fprintf(stderr, "SmolVLA expert resident layer=%d prefix_tokens=%zu scheduler_cuda_buffer_bytes=%zu\n",
+                     state->layer, prefix_tokens,
+                     ggml_backend_sched_get_buffer_size(candidate->runtime.sched.get(), candidate->runtime.backends->cuda.get()));
+        state->resident = std::move(candidate);
+        workspace.resident_uploaded[state->layer] = false;
+    }
+    auto & cached = *state->resident;
+    if (!workspace.resident_uploaded[state->layer]) {
+        for (size_t i = 0; i < prefix_tokens * 320; ++i) if (!std::isfinite(static_k[i]) || !std::isfinite(static_v[i])) {
+            error = "invalid key/value"; return false;
+        }
+        const auto & positions = state->cross ? workspace.cross_positions : workspace.self_positions;
+        const auto & mask = state->cross ? workspace.cross_float_mask : workspace.self_float_mask;
+        ggml_backend_tensor_set(cached.prefix_k, static_k, 0, prefix_tokens * 320 * sizeof(float));
+        ggml_backend_tensor_set(cached.prefix_v, static_v, 0, prefix_tokens * 320 * sizeof(float));
+        ggml_backend_tensor_set(cached.positions, positions.data(), 0, positions.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(cached.mask, mask.data(), 0, mask.size() * sizeof(float));
+        workspace.resident_uploaded[state->layer] = true;
+    }
+    ggml_backend_tensor_set(cached.hidden, hidden, 0, 50 * 720 * sizeof(float));
+    if (cached.runtime.compute(cached.graph) != GGML_STATUS_SUCCESS) {
+        state->resident.reset(); workspace.resident_uploaded[state->layer] = false;
+        error = "resident expert graph failed"; return false;
+    }
+    float validation = 0.0f;
+    ggml_backend_tensor_get(cached.validation, &validation, 0, sizeof(validation));
+    if (!std::isfinite(validation)) { error = "non-finite resident expert intermediate"; return false; }
+    output.resize(50 * 720);
+    ggml_backend_tensor_get(cached.result, output.data(), 0, output.size() * sizeof(float));
+    return true;
+}
+
 bool smolvla_expert_mlp::forward(const float * hidden, const float * prefix_k, const float * prefix_v,
                                   const std::vector<uint8_t> & prefix_valid, std::vector<float> & output,
                                   std::string & error) {
+    return forward_impl(hidden, prefix_k, prefix_v, prefix_valid, output, error, nullptr);
+}
+
+bool smolvla_expert_mlp::forward_impl(const float * hidden, const float * prefix_k, const float * prefix_v,
+                                      const std::vector<uint8_t> & prefix_valid, std::vector<float> & output,
+                                      std::string & error, sample_workspace * workspace) {
     output.clear();
     if (!hidden || !prefix_k || !prefix_v || prefix_valid.empty()) { error = "invalid expert layer input"; return false; }
-    std::vector<uint8_t> self_mask, cross_mask;
-    std::vector<int32_t> positions;
-    if (!smolvla_input::build_suffix_attention(prefix_valid, 50, self_mask, cross_mask, positions, error)) return false;
-    std::vector<float> q, k, v;
-    if (!project_qkv(hidden, prefix_k, prefix_v, prefix_valid.size(), q, k, v, error)) return false;
-    if (state->cross) {
-        const int32_t first = positions[0];
-        for (int32_t & position : positions) position -= first;
+    if (workspace && workspace->resident) return forward_resident(hidden, prefix_k, prefix_v, prefix_valid.size(), output, error, *workspace);
+    sample_workspace local;
+    auto & work = workspace ? *workspace : local;
+    if (!workspace) {
+        if (!smolvla_input::build_suffix_attention(prefix_valid, 50, work.self_mask, work.cross_mask, work.self_positions, error)) return false;
+        work.cross_positions = work.self_positions;
+        const int32_t first = work.cross_positions[0];
+        for (int32_t & position : work.cross_positions) position -= first;
     }
-    std::vector<float> rotated_q;
-    if (!smolvla::expert_rope(q.data(), 50, 15, positions.data(), state->threads, rotated_q, error)) return false;
+    const auto & positions = state->cross ? work.cross_positions : work.self_positions;
+    auto & q = work.q;
+    if (!project_qkv_impl(hidden, prefix_k, prefix_v, prefix_valid.size(), q, work.k, work.v, error, workspace)) return false;
+    auto & k = workspace && state->cross ? work.projected_k[state->layer] : work.k;
+    auto & v = workspace && state->cross ? work.projected_v[state->layer] : work.v;
+    auto & rotated_q = work.rotated_q;
+    if (!smolvla::expert_rope(q.data(), 50, 15, positions.data(), state->threads, rotated_q, error, state->backend)) return false;
     // RoPE returns the original query dtype (BF16).
     for (float & x : rotated_q) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
     if (!state->cross) {
-        std::vector<float> rotated_k;
-        if (!smolvla::expert_rope(k.data(), 50, 5, positions.data(), state->threads, rotated_k, error)) return false;
+        auto & rotated_k = work.rotated_k;
+        if (!smolvla::expert_rope(k.data(), 50, 5, positions.data(), state->threads, rotated_k, error, state->backend)) return false;
         for (float & x : rotated_k) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
-        std::vector<float> full_k(prefix_k, prefix_k + prefix_valid.size() * 320);
-        std::vector<float> full_v(prefix_v, prefix_v + prefix_valid.size() * 320);
+        auto & full_k = work.full_k;
+        auto & full_v = work.full_v;
+        full_k.assign(prefix_k, prefix_k + prefix_valid.size() * 320);
+        full_v.assign(prefix_v, prefix_v + prefix_valid.size() * 320);
         full_k.insert(full_k.end(), rotated_k.begin(), rotated_k.end());
         full_v.insert(full_v.end(), v.begin(), v.end());
         k.swap(full_k); v.swap(full_v);
     }
-    std::vector<float> attn;
-    const auto & mask = state->cross ? cross_mask : self_mask;
+    auto & attn = work.attention;
+    const auto & mask = state->cross ? work.cross_mask : work.self_mask;
     if (!smolvla::attention(rotated_q.data(), k.data(), v.data(), 50, k.size() / 320, mask.data(),
-                            state->threads, attn, error, !state->cross)) return false;
+                            state->threads, attn, error, !state->cross, state->backend)) return false;
     if (!state->cross) for (float & x : attn) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
     return finish_layer(hidden, attn.data(), output, error);
 }
@@ -884,26 +1293,29 @@ bool smolvla_expert_mlp::forward(const float * hidden, const float * prefix_k, c
 struct smolvla_expert::impl {
     std::vector<std::unique_ptr<smolvla_expert_mlp>> layers;
     std::unique_ptr<smolvla_action_input> projections;
+    std::unique_ptr<resident_expert_chain> chain, step;
+    // Both graphs reference layer and projection weights; destroy them first.
+    ~impl() { step.reset(); chain.reset(); }
 };
 smolvla_expert::smolvla_expert() : state(new impl) {}
 smolvla_expert::~smolvla_expert() = default;
-std::unique_ptr<smolvla_expert> smolvla_expert::open(const char * path, int threads, std::string & error) {
+std::unique_ptr<smolvla_expert> smolvla_expert::open(const char * path, int threads, std::string & error, const smolvla_backend_options & backend) {
     auto model = std::unique_ptr<smolvla_expert>(new smolvla_expert);
-    model->state->projections = smolvla_action_input::open(path, threads, error);
+    model->state->projections = smolvla_action_input::open(path, threads, error, backend);
     if (!model->state->projections) return nullptr;
     for (int i = 0; i < 16; ++i) {
-        auto layer = smolvla_expert_mlp::open(path, i, threads, error);
+        auto layer = smolvla_expert_mlp::open(path, i, threads, error, backend);
         if (!layer) return nullptr;
         model->state->layers.push_back(std::move(layer));
     }
     return model;
 }
-std::unique_ptr<smolvla_expert> smolvla_expert::open(const llama_model * source, int threads, std::string & error) {
+std::unique_ptr<smolvla_expert> smolvla_expert::open(const llama_model * source, int threads, std::string & error, const smolvla_backend_options & backend) {
     auto model = std::unique_ptr<smolvla_expert>(new smolvla_expert);
-    model->state->projections = smolvla_action_input::open(source, threads, error);
+    model->state->projections = smolvla_action_input::open(source, threads, error, backend);
     if (!model->state->projections) return nullptr;
     for (int i = 0; i < 16; ++i) {
-        auto layer = smolvla_expert_mlp::open(source, i, threads, error);
+        auto layer = smolvla_expert_mlp::open(source, i, threads, error, backend);
         if (!layer) return nullptr;
         model->state->layers.push_back(std::move(layer));
     }
@@ -924,6 +1336,7 @@ bool smolvla_expert::forward(const float * suffix, const std::vector<std::vector
     }
     std::vector<float> hidden(suffix, suffix + 50 * 720), next;
     for (size_t i = 0; i < state->layers.size(); ++i) {
+        SMOLVLA_PROFILE_SCOPE_ID("smolvla.expert.layer", i);
         if (!state->layers[i]->forward(hidden.data(), keys[i].data(), values[i].data(), mask, next, error)) return false;
         hidden.swap(next);
     }
@@ -935,11 +1348,157 @@ bool smolvla_expert::sample(const std::vector<float> & noise, const std::vector<
                             const std::vector<std::vector<float>> & values, const std::vector<uint8_t> & mask,
                             std::vector<float> & actions, std::string & error) {
     if (noise.size() != 50 * 32) { actions.clear(); error = "invalid action noise shape"; return false; }
+    smolvla_expert_mlp::sample_workspace work;
+    const char * resident_mode = std::getenv("SMOLVLA_EXPERT_RESIDENT");
+    work.resident = (!resident_mode || std::strcmp(resident_mode, "1") == 0) &&
+                    !state->layers.empty() && state->layers[0]->state->backend.backend == smolvla_backend::cuda;
+    const char * chain_mode = std::getenv("SMOLVLA_EXPERT_CHAIN");
+    // Default to the qualified layer chain; explicit 0 keeps single-layer graphs.
+    const bool chain = work.resident && (!chain_mode || std::strcmp(chain_mode, "1") == 0);
+    const char * step_mode = std::getenv("SMOLVLA_EXPERT_STEP");
+    // Default to the qualified complete velocity-step graph; explicit 0 keeps the layer chain.
+    const bool complete_step = chain && (!step_mode || std::strcmp(step_mode, "1") == 0);
+    auto & chain_cache = complete_step ? state->step : state->chain;
+    bool prepared = false;
+#if defined(SMOLVLA_NVTX)
+    size_t step_index = 0;
+#endif
     auto velocity = [&](const std::vector<float> & current, float time, std::vector<float> & result, std::string & err) {
-        std::vector<float> suffix, hidden;
-        if (!state->projections->encode(current.data(), time, suffix, err)) return false;
-        if (!forward(suffix.data(), keys, values, mask, hidden, err)) return false;
-        return state->projections->project_velocity(hidden.data(), result, err);
+        SMOLVLA_PROFILE_SCOPE_ID("smolvla.expert.step", step_index++);
+        if (complete_step) {
+            // Same encode input checks, before any request/cache setup.
+            if (!std::isfinite(time) || time < 0 || time > 1) { err = "invalid action input or time"; return false; }
+            for (float x : current) if (!std::isfinite(x)) { err = "non-finite action input"; return false; }
+        } else if (!state->projections->encode(current.data(), time, work.suffix, err)) return false;
+        if (!prepared) {
+            // Keep setup inside Euler's first callback: noise validation and the
+            // existing encode/input validation ordering remain ahead of setup.
+            if (mask.empty() || keys.size() != 16 || values.size() != 16) { err = "invalid expert input"; return false; }
+            if (chain && mask.size() > 1024 - 50) { err = "invalid attention input"; return false; }
+            for (size_t i = 0; i < 16; ++i) {
+                if (keys[i].size() != mask.size() * 320 || values[i].size() != mask.size() * 320) {
+                    err = "invalid expert KV cache shape"; return false;
+                }
+            }
+            if (!smolvla_input::build_suffix_attention(mask, 50, work.self_mask, work.cross_mask, work.self_positions, err)) return false;
+            work.cross_positions = work.self_positions;
+            const int32_t first = work.cross_positions[0];
+            for (int32_t & position : work.cross_positions) position -= first;
+            if (work.resident) {
+                auto float_mask = [](const std::vector<uint8_t> & input, std::vector<float> & output) {
+                    output.resize(input.size());
+                    for (size_t i = 0; i < input.size(); ++i) output[i] = input[i] ? 0.0f : -std::numeric_limits<float>::max();
+                };
+                float_mask(work.self_mask, work.self_float_mask);
+                float_mask(work.cross_mask, work.cross_float_mask);
+            }
+            for (size_t i = 1; i < state->layers.size(); i += 2) {
+                SMOLVLA_PROFILE_SCOPE_ID("smolvla.expert.cross_kv_precompute", i);
+                if (!state->layers[i]->prepare_cross_kv(keys[i].data(), values[i].data(), mask.size(), work, err)) return false;
+            }
+            prepared = true;
+        }
+        if (chain) {
+            SMOLVLA_PROFILE_SCOPE("smolvla.expert.resident_chain");
+            if (!chain_cache || chain_cache->combined.prefix_tokens != mask.size()) {
+                auto & first = *state->layers[0]->state;
+                auto candidate = std::unique_ptr<resident_expert_chain>(new resident_expert_chain(first.threads, first.backend));
+                auto & combined = candidate->combined;
+                auto * ctx = combined.ctx.get();
+                if (!ctx || !combined.runtime.sched) { err = "cannot initialize expert chain"; return false; }
+                auto * weights = state->projections->state->tensors;
+                if (complete_step) {
+                    candidate->actions = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, action_dim, steps);
+                    candidate->time = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, steps);
+                    ggml_set_input(candidate->actions); ggml_set_input(candidate->time);
+                    combined.hidden = build_action_encode(ctx, weights, candidate->actions, candidate->time);
+                    // Protect the former encode readback boundary from in-place reuse.
+                    ggml_set_output(combined.hidden);
+                } else {
+                    combined.hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 720, 50);
+                    ggml_set_input(combined.hidden);
+                }
+                auto * hidden = combined.hidden;
+                for (size_t i = 0; i < state->layers.size(); ++i) {
+                    auto & layer = candidate->layers[i];
+                    build_resident_expert_layer(ctx, &layer, state->layers[i]->state.get(), hidden, mask.size(), true);
+                    hidden = layer.result;
+                    combined.validation = combined.validation ? ggml_add(ctx, combined.validation, layer.validation) : layer.validation;
+                }
+                combined.result = hidden;
+                if (complete_step) {
+                    auto * normalized = build_expert_norm(ctx, weights, hidden);
+                    ggml_set_output(normalized);
+                    // project_velocity checks every normalized element; Euler checks
+                    // every velocity. Keep both probes device-side as well.
+                    auto validate = [&](ggml_tensor * t) {
+                        combined.validation = ggml_add(ctx, combined.validation, ggml_sum(ctx, ggml_scale(ctx, t, 0.0f)));
+                    };
+                    validate(normalized);
+                    combined.result = build_velocity_projection(ctx, weights, normalized);
+                    validate(combined.result);
+                }
+                ggml_set_output(combined.result); ggml_set_output(combined.validation);
+                combined.graph = ggml_new_graph_custom(ctx, 16384, false);
+                ggml_build_forward_expand(combined.graph, combined.result);
+                ggml_build_forward_expand(combined.graph, combined.validation);
+                if (!combined.runtime.allocate(combined.graph)) { err = "cannot allocate expert chain"; return false; }
+                combined.prefix_tokens = mask.size();
+                std::fprintf(stderr, "SmolVLA expert resident %s layers=16 prefix_tokens=%zu scheduler_cuda_buffer_bytes=%zu\n",
+                             complete_step ? "step" : "chain", mask.size(),
+                             ggml_backend_sched_get_buffer_size(combined.runtime.sched.get(), combined.runtime.backends->cuda.get()));
+                chain_cache = std::move(candidate);
+                for (bool & uploaded : work.resident_uploaded) uploaded = false;
+            }
+            // Per-request flags, never cache contents solely by tensor shape.
+            for (size_t i = 0; i < state->layers.size(); ++i) {
+                if (work.resident_uploaded[i]) continue;
+                const bool cross = state->layers[i]->state->cross;
+                const auto & k = cross ? work.projected_k[i] : keys[i];
+                const auto & v = cross ? work.projected_v[i] : values[i];
+                for (size_t j = 0; j < k.size(); ++j) if (!std::isfinite(k[j]) || !std::isfinite(v[j])) {
+                    err = "invalid key/value"; return false;
+                }
+                const auto & positions = cross ? work.cross_positions : work.self_positions;
+                const auto & float_mask = cross ? work.cross_float_mask : work.self_float_mask;
+                auto & layer = chain_cache->layers[i];
+                ggml_backend_tensor_set(layer.prefix_k, k.data(), 0, k.size() * sizeof(float));
+                ggml_backend_tensor_set(layer.prefix_v, v.data(), 0, v.size() * sizeof(float));
+                ggml_backend_tensor_set(layer.positions, positions.data(), 0, positions.size() * sizeof(int32_t));
+                ggml_backend_tensor_set(layer.mask, float_mask.data(), 0, float_mask.size() * sizeof(float));
+                work.resident_uploaded[i] = true;
+            }
+            auto & cached = chain_cache->combined;
+            if (complete_step) {
+                const auto time_values = action_time_values(time);
+                ggml_backend_tensor_set(chain_cache->actions, current.data(), 0, current.size() * sizeof(float));
+                ggml_backend_tensor_set(chain_cache->time, time_values.data(), 0, time_values.size() * sizeof(float));
+            } else {
+                ggml_backend_tensor_set(cached.hidden, work.suffix.data(), 0, work.suffix.size() * sizeof(float));
+            }
+            if (cached.runtime.compute(cached.graph) != GGML_STATUS_SUCCESS) {
+                chain_cache.reset(); err = "expert chain/step graph failed"; return false;
+            }
+            float validation = 0.0f;
+            ggml_backend_tensor_get(cached.validation, &validation, 0, sizeof(validation));
+            if (!std::isfinite(validation)) { err = "non-finite expert chain/step intermediate"; return false; }
+            if (complete_step) {
+                result.resize(steps * action_dim);
+                ggml_backend_tensor_get(cached.result, result.data(), 0, result.size() * sizeof(float));
+                return true;
+            }
+            work.hidden.resize(50 * 720);
+            ggml_backend_tensor_get(cached.result, work.hidden.data(), 0, work.hidden.size() * sizeof(float));
+        } else {
+            work.hidden.assign(work.suffix.begin(), work.suffix.end());
+            for (size_t i = 0; i < state->layers.size(); ++i) {
+                SMOLVLA_PROFILE_SCOPE_ID("smolvla.expert.layer", i);
+                if (!state->layers[i]->forward_impl(work.hidden.data(), keys[i].data(), values[i].data(), mask, work.next, err, &work)) return false;
+                work.hidden.swap(work.next);
+            }
+        }
+        if (!state->projections->normalize_expert(work.hidden.data(), work.normalized, err)) return false;
+        return state->projections->project_velocity(work.normalized.data(), result, err);
     };
     return smolvla::euler_integrate(noise, 10, velocity, actions, error);
 }
@@ -972,35 +1531,43 @@ struct smolvla_prefix::impl {
     layer_weights w[layers]{};
     ggml_tensor * token_embedding = nullptr;
     int threads = 1;
+    smolvla_backend_options backend;
+    std::shared_ptr<graph_backends> execution;
+    weight_buffer buffer{nullptr, ggml_backend_buffer_free};
 
     // A scheduler owns its graph allocation; destroy it before the graph context
     // and destroy all cached graphs before releasing their referenced weights.
     struct cached_graph {
         std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, ggml_free};
-        cpu_graph_scheduler runtime;
+        graph_scheduler runtime;
         ggml_cgraph * graph = nullptr;
         ggml_tensor * input = nullptr;
         ggml_tensor * input2 = nullptr;
         ggml_tensor * output = nullptr;
         ggml_tensor * output2 = nullptr;
         ggml_tensor * output3 = nullptr;
+        ggml_tensor * positions = nullptr;
+        ggml_tensor * mask = nullptr;
+        ggml_tensor * validation = nullptr;
         size_t n = 0;
-        explicit cached_graph(int threads) : runtime(threads) {}
+        cached_graph(int threads, const smolvla_backend_options & options) : runtime(threads, options) {}
     };
     std::unique_ptr<cached_graph> embedding;
     std::unique_ptr<cached_graph> qkv[layers];
     std::unique_ptr<cached_graph> residual[layers];
+    std::unique_ptr<cached_graph> resident[layers];
     size_t forward_n = 0;
     ~impl() {
         embedding.reset();
-        for (int i = 0; i < layers; ++i) { qkv[i].reset(); residual[i].reset(); }
+        for (int i = 0; i < layers; ++i) { qkv[i].reset(); residual[i].reset(); resident[i].reset(); }
+        buffer.reset();
         if (weights) ggml_free(weights);
     }
 };
 smolvla_prefix::smolvla_prefix() : state(new impl) {}
 smolvla_prefix::~smolvla_prefix() = default;
 
-std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const char * path, int threads, std::string & error) {
+std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const char * path, int threads, std::string & error, const smolvla_backend_options & backend) {
     error.clear();
     if (!path || !*path || threads <= 0) { error="invalid prefix configuration"; return nullptr; }
     ggml_context * meta_ptr=nullptr;
@@ -1020,7 +1587,7 @@ std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const char * path, int thre
         auto * t=ggml_get_tensor(meta.get(),name.c_str());
         if(!t || t->ne[0]!=a[j] || t->ne[1]!=b[j] || t->ne[2]!=1 || t->ne[3]!=1 ||
            (t->type!=GGML_TYPE_F32 && t->type!=GGML_TYPE_F16 && t->type!=GGML_TYPE_BF16)) { error="invalid prefix tensor: "+name; return nullptr; }
-        bytes+=ggml_nbytes(t)+ggml_tensor_overhead()+64;
+        bytes+=ggml_tensor_overhead()+64;
     }
     auto * token_meta = ggml_get_tensor(meta.get(), "token_embd.weight");
     const auto token_id = gguf_find_tensor(file.get(), "token_embd.weight");
@@ -1029,38 +1596,41 @@ std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const char * path, int thre
         (token_meta->type != GGML_TYPE_F32 && token_meta->type != GGML_TYPE_F16 && token_meta->type != GGML_TYPE_BF16)) {
         error = "invalid token embedding tensor"; return nullptr;
     }
-    bytes += ggml_nbytes(token_meta) + ggml_tensor_overhead() + 64;
+    bytes += ggml_tensor_overhead() + 64;
     auto result=std::unique_ptr<smolvla_prefix>(new smolvla_prefix);
-    result->state->threads=threads; result->state->weights=ggml_init({bytes,nullptr,false});
+    result->state->threads=threads; result->state->backend=backend;
+    result->state->execution=acquire_backends(threads,backend);
+    if (!result->state->execution->error.empty()) { error=result->state->execution->error; return nullptr; }
+    result->state->weights=ggml_init({bytes,nullptr,true});
     if(!result->state->weights) { error="cannot allocate prefix weights"; return nullptr; }
     std::ifstream in(path,std::ios::binary); if(!in) { error="cannot open prefix GGUF"; return nullptr; }
     result->state->token_embedding = ggml_new_tensor(result->state->weights, token_meta->type, 2, token_meta->ne);
-    const size_t token_offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), token_id);
-    if (token_offset > (size_t)std::numeric_limits<std::streamoff>::max()) { error="invalid token embedding offset"; return nullptr; }
-    in.seekg((std::streamoff)token_offset);
-    in.read(static_cast<char *>(result->state->token_embedding->data), ggml_nbytes(result->state->token_embedding));
-    if (!in) { error="cannot read token embedding"; return nullptr; }
+    ggml_set_name(result->state->token_embedding, "token_embd.weight");
+    std::vector<std::pair<ggml_tensor *, int64_t>> loading{{result->state->token_embedding, token_id}};
     for(int l=0;l<layers;++l) {
         auto & w=result->state->w[l]; ggml_tensor ** dst[]={&w.norm,&w.q,&w.k,&w.v,&w.out,&w.ffn_norm,&w.gate,&w.up,&w.down};
         for(int j=0;j<9;++j) {
             const std::string name="blk."+std::to_string(l)+"."+names[j];
             auto * t=ggml_get_tensor(meta.get(),name.c_str()); const auto id=gguf_find_tensor(file.get(),name.c_str());
             *dst[j]=ggml_new_tensor(result->state->weights,t->type,2,t->ne);
-            size_t offset=gguf_get_data_offset(file.get())+gguf_get_tensor_offset(file.get(),id);
-            if(offset>(size_t)std::numeric_limits<std::streamoff>::max()) { error="invalid prefix tensor offset"; return nullptr; }
-            in.seekg((std::streamoff)offset); in.read(static_cast<char *>((*dst[j])->data),ggml_nbytes(*dst[j]));
-            if(!in) { error="cannot read prefix tensor: "+name; return nullptr; }
+            ggml_set_name(*dst[j],name.c_str());
+            loading.emplace_back(*dst[j],id);
         }
     }
+    if (!load_weight_buffer(result->state->weights, file.get(), in, loading,
+                            *result->state->execution, result->state->buffer, error)) return nullptr;
     return result;
 }
 
-std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const llama_model * model, int threads, std::string & error) {
+std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const llama_model * model, int threads, std::string & error, const smolvla_backend_options & backend) {
     error.clear();
     if (!model || threads <= 0) { error = "invalid prefix configuration"; return nullptr; }
     auto result = std::unique_ptr<smolvla_prefix>(new smolvla_prefix);
     result->state->threads = threads;
-    result->state->token_embedding = borrowed_tensor(model, "token_embd.weight", 960, 49280, error);
+    result->state->backend = backend;
+    result->state->execution = acquire_backends(threads, backend);
+    if (!result->state->execution->error.empty()) { error = result->state->execution->error; return nullptr; }
+    result->state->token_embedding = borrowed_tensor(model, "token_embd.weight", 960, 49280, error, backend);
     if (!result->state->token_embedding) return nullptr;
     const char * names[] = {"attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
     const int64_t a[] = {960,960,960,960,960,960,960,960,2560};
@@ -1069,7 +1639,7 @@ std::unique_ptr<smolvla_prefix> smolvla_prefix::open(const llama_model * model, 
         auto & w = result->state->w[l];
         ggml_tensor ** dst[] = {&w.norm,&w.q,&w.k,&w.v,&w.out,&w.ffn_norm,&w.gate,&w.up,&w.down};
         for (int j = 0; j < 9; ++j) {
-            *dst[j] = borrowed_tensor(model, "blk." + std::to_string(l) + "." + names[j], a[j], b[j], error);
+            *dst[j] = borrowed_tensor(model, "blk." + std::to_string(l) + "." + names[j], a[j], b[j], error, backend);
             if (!*dst[j]) return nullptr;
         }
     }
@@ -1083,7 +1653,7 @@ bool smolvla_prefix::embed_tokens(const std::vector<int32_t> & tokens, std::vect
     if (!state->embedding || state->embedding->n != tokens.size()) {
         // Discard the old allocation first to bound peak backend memory.
         state->embedding.reset();
-        auto cache = std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads));
+        auto cache = std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads, state->backend));
         cache->ctx.reset(ggml_init({1024*1024,nullptr,true}));
         if (!cache->ctx) { error="cannot allocate token embedding graph"; return false; }
         if (!cache->runtime.sched) { error="cannot initialize token embedding scheduler"; return false; }
@@ -1093,13 +1663,13 @@ bool smolvla_prefix::embed_tokens(const std::vector<int32_t> & tokens, std::vect
         cache->output=ggml_get_rows(ctx,state->token_embedding,cache->input);
         ggml_set_output(cache->output);
         cache->graph=ggml_new_graph(ctx); ggml_build_forward_expand(cache->graph,cache->output);
-        if (!ggml_backend_sched_alloc_graph(cache->runtime.sched.get(),cache->graph)) { error="cannot allocate token embedding scheduler graph"; return false; }
+        if (!cache->runtime.allocate(cache->graph)) { error="cannot allocate token embedding scheduler graph"; return false; }
         cache->n=tokens.size();
         state->embedding=std::move(cache);
     }
     auto & cache=*state->embedding;
     ggml_backend_tensor_set(cache.input,tokens.data(),0,tokens.size()*sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(cache.runtime.sched.get(),cache.graph)!=GGML_STATUS_SUCCESS) {
+    if (cache.runtime.compute(cache.graph)!=GGML_STATUS_SUCCESS) {
         state->embedding.reset(); error="token embedding graph failed"; return false;
     }
     output.resize(tokens.size()*960);
@@ -1143,16 +1713,133 @@ bool smolvla_prefix::forward(const std::vector<float> & prefix, const std::vecto
     if(!n || n>1024 || prefix.size()!=n*960 || mask.size()!=n*n) { error="invalid prefix input shape"; return false; }
     for(float x:prefix) if(!std::isfinite(x)) { error="non-finite prefix"; return false; }
     if (state->forward_n != n) {
-        for (int i=0; i<layers; ++i) { state->qkv[i].reset(); state->residual[i].reset(); }
+        for (int i=0; i<layers; ++i) { state->qkv[i].reset(); state->residual[i].reset(); state->resident[i].reset(); }
         state->forward_n=n;
+    }
+    // CUDA defaults to resident layers after all-layer K/V and policy bitwise
+    // qualification. CPU and the explicit 0 override retain the staged path.
+    const char * resident_mode = std::getenv("SMOLVLA_PREFIX_RESIDENT");
+    const bool resident = (!resident_mode || std::strcmp(resident_mode, "1") == 0) &&
+                          state->backend.backend == smolvla_backend::cuda;
+    std::vector<float> float_mask;
+    if (resident) {
+        float_mask.resize(mask.size());
+        for (size_t i=0; i<mask.size(); ++i) {
+            if (mask[i] > 1) { error="invalid attention mask"; return false; }
+            // Finite minimum, not -Inf: fully masked rows remain uniform.
+            float_mask[i] = mask[i] ? 0.0f : -std::numeric_limits<float>::max();
+        }
     }
     std::vector<float> hidden=prefix;
     std::vector<std::vector<float>> next_keys, next_values;
     for(int l=0;l<layers;++l) {
+        SMOLVLA_PROFILE_SCOPE_ID("smolvla.prefix.layer", l);
         auto & w=state->w[l];
+        if (resident) {
+            if (!state->resident[l]) {
+                auto cache=std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads, state->backend));
+                cache->ctx.reset(ggml_init({1024*1024,nullptr,true}));
+                if (!cache->ctx || !cache->runtime.sched) { error="cannot initialize resident prefix graph"; return false; }
+                auto * ctx=cache->ctx.get();
+                auto retain=[](ggml_tensor * t) {
+                    // A view alone does not protect its allocation root from
+                    // reuse/in-place consumers at a former staged boundary.
+                    ggml_set_output(t);
+                    while (t->view_src) { t=t->view_src; ggml_set_output(t); }
+                };
+                auto round=[&](ggml_tensor * t) { return ggml_cast(ctx,ggml_cast(ctx,t,GGML_TYPE_BF16),GGML_TYPE_F32); };
+                auto validate=[&](ggml_tensor * t) {
+                    // Diagnostic only: finite -> zero, NaN/Inf -> NaN. Retain
+                    // staged finite checks without copying intermediates out.
+                    auto * probe=ggml_sum(ctx,ggml_scale(ctx,t,0.0f));
+                    cache->validation=cache->validation ? ggml_add(ctx,cache->validation,probe) : probe;
+                };
+                cache->input=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,960,n);
+                cache->positions=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,n);
+                ggml_set_input(cache->input); ggml_set_input(cache->positions);
+                auto rope=[&](ggml_tensor * t, int64_t heads) {
+                    retain(t); validate(t);
+                    // Converter interleaves Q/K pairs. [2,32,heads,n] ->
+                    // [32,2,heads,n] restores the canonical split-half layout.
+                    t=ggml_reshape_4d(ctx,t,2,32,heads,n);
+                    t=ggml_cont(ctx,ggml_permute(ctx,t,1,0,2,3));
+                    t=ggml_reshape_3d(ctx,t,64,heads,n);
+                    retain(t);
+                    t=ggml_rope_ext(ctx,t,cache->positions,nullptr,64,GGML_ROPE_TYPE_NEOX,
+                                    0,10000.0f,1.0f,0.0f,1.0f,0.0f,0.0f);
+                    retain(t);
+                    t=round(t); retain(t);
+                    return t;
+                };
+                auto * norm=ggml_rms_norm(ctx,cache->input,1e-5f);
+                if (l>0) norm=round(norm);
+                norm=round(ggml_mul(ctx,norm,vector_weight(ctx,w.norm)));
+                auto * k=rope(round(ggml_mul_mat(ctx,w.k,norm)),5);
+                auto * v=round(ggml_mul_mat(ctx,w.v,norm));
+                retain(v); validate(k); validate(v);
+                cache->output2=k; cache->output3=v;
+                if (l+1<layers) {
+                    auto * q=rope(round(ggml_mul_mat(ctx,w.q,norm)),15);
+                    validate(q);
+                    auto expand=[&](ggml_tensor * t) {
+                        t=ggml_reshape_4d(ctx,t,64,1,5,n);
+                        t=ggml_repeat_4d(ctx,t,64,3,5,n);
+                        t=ggml_reshape_3d(ctx,t,64,15,n);
+                        retain(t);
+                        return t;
+                    };
+                    k=expand(k); v=expand(v);
+                    cache->mask=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,n,n);
+                    ggml_set_input(cache->mask);
+                    auto * qp=ggml_permute(ctx,q,0,2,1,3);
+                    auto * kp=ggml_permute(ctx,k,0,2,1,3);
+                    auto * vp=ggml_cont(ctx,ggml_permute(ctx,v,1,2,0,3));
+                    auto * scores=ggml_mul_mat(ctx,kp,qp);
+                    auto * probabilities=round(ggml_soft_max_ext(ctx,scores,cache->mask,0.125f,0.0f));
+                    auto * attn=ggml_mul_mat(ctx,vp,probabilities);
+                    attn=ggml_cont_2d(ctx,ggml_permute(ctx,attn,0,2,1,3),960,n);
+                    retain(attn);
+                    attn=round(attn); retain(attn);
+                    // The residual/MLP order is exactly the staged graph's.
+                    auto * residual=round(ggml_add(ctx,round(ggml_mul_mat(ctx,w.out,attn)),cache->input));
+                    auto * z=round(ggml_rms_norm(ctx,residual,1e-5f));
+                    z=round(ggml_mul(ctx,z,vector_weight(ctx,w.ffn_norm)));
+                    auto * gate=round(ggml_mul_mat(ctx,w.gate,z));
+                    auto * up=round(ggml_mul_mat(ctx,w.up,z));
+                    auto * inner=round(ggml_mul(ctx,round(ggml_silu(ctx,gate)),up));
+                    cache->output=round(ggml_add(ctx,round(ggml_mul_mat(ctx,w.down,inner)),residual));
+                    ggml_set_output(cache->output);
+                }
+                // Layer 15 computes only canonical K/V (no Q/attention/MLP).
+                ggml_set_output(cache->output2); ggml_set_output(cache->output3);
+                ggml_set_output(cache->validation);
+                cache->graph=ggml_new_graph(ctx);
+                if (cache->output) ggml_build_forward_expand(cache->graph,cache->output);
+                ggml_build_forward_expand(cache->graph,cache->output2);
+                ggml_build_forward_expand(cache->graph,cache->output3);
+                ggml_build_forward_expand(cache->graph,cache->validation);
+                if (!cache->runtime.allocate(cache->graph)) { error="cannot allocate resident prefix scheduler graph"; return false; }
+                cache->n=n; state->resident[l]=std::move(cache);
+            }
+            auto & cache=*state->resident[l];
+            ggml_backend_tensor_set(cache.input,hidden.data(),0,hidden.size()*sizeof(float));
+            ggml_backend_tensor_set(cache.positions,positions.data(),0,positions.size()*sizeof(int32_t));
+            if (cache.mask) ggml_backend_tensor_set(cache.mask,float_mask.data(),0,float_mask.size()*sizeof(float));
+            if (cache.runtime.compute(cache.graph)!=GGML_STATUS_SUCCESS) {
+                state->resident[l].reset(); error="resident prefix graph failed"; return false;
+            }
+            float validation=0.0f;
+            ggml_backend_tensor_get(cache.validation,&validation,0,sizeof(validation));
+            if (!std::isfinite(validation)) { error="non-finite resident prefix intermediate"; return false; }
+            next_keys.emplace_back(n*320); next_values.emplace_back(n*320);
+            ggml_backend_tensor_get(cache.output2,next_keys.back().data(),0,n*320*sizeof(float));
+            ggml_backend_tensor_get(cache.output3,next_values.back().data(),0,n*320*sizeof(float));
+            if (cache.output) ggml_backend_tensor_get(cache.output,hidden.data(),0,hidden.size()*sizeof(float));
+            continue;
+        }
         if (!state->qkv[l] || state->qkv[l]->n != n) {
             state->qkv[l].reset();
-            auto cache=std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads));
+            auto cache=std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads, state->backend));
             cache->ctx.reset(ggml_init({1024*1024,nullptr,true}));
             if(!cache->ctx) { error="cannot allocate prefix graph"; return false; }
             if(!cache->runtime.sched) { error="cannot initialize prefix scheduler"; return false; }
@@ -1161,35 +1848,50 @@ bool smolvla_prefix::forward(const std::vector<float> & prefix, const std::vecto
             auto round=[&](ggml_tensor * t) { return ggml_cast(ctx,ggml_cast(ctx,t,GGML_TYPE_BF16),GGML_TYPE_F32); };
             auto * norm=ggml_rms_norm(ctx,cache->input,1e-5f);
             if(l>0) norm=round(norm);
-            norm=round(ggml_mul(ctx,norm,w.norm));
-            cache->output=round(ggml_mul_mat(ctx,w.q,norm));
+            norm=round(ggml_mul(ctx,norm,vector_weight(ctx,w.norm)));
+            // No consumer uses the last layer's hidden output, only its K/V.
+            if(l+1<layers) cache->output=round(ggml_mul_mat(ctx,w.q,norm));
             cache->output2=round(ggml_mul_mat(ctx,w.k,norm));
             cache->output3=round(ggml_mul_mat(ctx,w.v,norm));
-            ggml_set_output(cache->output); ggml_set_output(cache->output2); ggml_set_output(cache->output3);
+            if(cache->output) ggml_set_output(cache->output);
+            ggml_set_output(cache->output2); ggml_set_output(cache->output3);
             cache->graph=ggml_new_graph(ctx);
-            ggml_build_forward_expand(cache->graph,cache->output); ggml_build_forward_expand(cache->graph,cache->output2); ggml_build_forward_expand(cache->graph,cache->output3);
-            if(!ggml_backend_sched_alloc_graph(cache->runtime.sched.get(),cache->graph)) { error="cannot allocate prefix QKV scheduler graph"; return false; }
+            if(cache->output) ggml_build_forward_expand(cache->graph,cache->output);
+            ggml_build_forward_expand(cache->graph,cache->output2); ggml_build_forward_expand(cache->graph,cache->output3);
+            if(!cache->runtime.allocate(cache->graph)) { error="cannot allocate prefix QKV scheduler graph"; return false; }
             cache->n=n; state->qkv[l]=std::move(cache);
         }
         auto & qkv=*state->qkv[l];
         ggml_backend_tensor_set(qkv.input,hidden.data(),0,hidden.size()*sizeof(float));
-        if(ggml_backend_sched_graph_compute(qkv.runtime.sched.get(),qkv.graph)!=GGML_STATUS_SUCCESS) {
+        if(qkv.runtime.compute(qkv.graph)!=GGML_STATUS_SUCCESS) {
             state->qkv[l].reset(); error="prefix QKV failed"; return false;
         }
-        std::vector<float> qv(n*960),kv(n*320),vv(n*320),qr,kr;
-        ggml_backend_tensor_get(qkv.output,qv.data(),0,qv.size()*sizeof(float)); ggml_backend_tensor_get(qkv.output2,kv.data(),0,kv.size()*sizeof(float)); ggml_backend_tensor_get(qkv.output3,vv.data(),0,vv.size()*sizeof(float));
-        unpermute(qv.data(),n,15); unpermute(kv.data(),n,5);
-        if(!smolvla::expert_rope(qv.data(),n,15,positions.data(),state->threads,qr,error) ||
-           !smolvla::expert_rope(kv.data(),n,5,positions.data(),state->threads,kr,error)) return false;
-        for(float & z:qr) z=bf16(z);
+        std::vector<float> qv,kv(n*320),vv(n*320),qr,kr;
+        ggml_backend_tensor_get(qkv.output2,kv.data(),0,kv.size()*sizeof(float)); ggml_backend_tensor_get(qkv.output3,vv.data(),0,vv.size()*sizeof(float));
+        if(l+1<layers) {
+            qv.resize(n*960);
+            ggml_backend_tensor_get(qkv.output,qv.data(),0,qv.size()*sizeof(float));
+            unpermute(qv.data(),n,15);
+            if(!smolvla::expert_rope(qv.data(),n,15,positions.data(),state->threads,qr,error,state->backend)) return false;
+            for(float & z:qr) z=bf16(z);
+        }
+        unpermute(kv.data(),n,5);
+        if(!smolvla::expert_rope(kv.data(),n,5,positions.data(),state->threads,kr,error,state->backend)) return false;
         for(float & z:kr) z=bf16(z);
         next_keys.push_back(kr); next_values.push_back(vv);
+        if(l+1==layers) {
+            // Retain validation formerly performed by the discarded attention.
+            for(size_t i=0;i<kr.size();++i) if(!std::isfinite(kr[i]) || !std::isfinite(vv[i])) {
+                error="invalid key/value"; return false;
+            }
+            continue;
+        }
         std::vector<float> attn;
-        if(!smolvla::attention(qr.data(),kr.data(),vv.data(),n,n,mask.data(),state->threads,attn,error,true)) return false;
+        if(!smolvla::attention(qr.data(),kr.data(),vv.data(),n,n,mask.data(),state->threads,attn,error,true,state->backend)) return false;
         for(float & z:attn) z=bf16(z);
         if (!state->residual[l] || state->residual[l]->n != n) {
             state->residual[l].reset();
-            auto cache=std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads));
+            auto cache=std::unique_ptr<impl::cached_graph>(new impl::cached_graph(state->threads, state->backend));
             cache->ctx.reset(ggml_init({1024*1024,nullptr,true}));
             if(!cache->ctx) { error="cannot allocate prefix residual graph"; return false; }
             if(!cache->runtime.sched) { error="cannot initialize prefix residual scheduler"; return false; }
@@ -1199,19 +1901,19 @@ bool smolvla_prefix::forward(const std::vector<float> & prefix, const std::vecto
             ggml_set_input(cache->input); ggml_set_input(cache->input2);
             auto rnd=[&](ggml_tensor * t) { return ggml_cast(ctx,ggml_cast(ctx,t,GGML_TYPE_BF16),GGML_TYPE_F32); };
             auto * residual=rnd(ggml_add(ctx,rnd(ggml_mul_mat(ctx,w.out,cache->input2)),cache->input));
-            auto * z=rnd(ggml_rms_norm(ctx,residual,1e-5f)); z=rnd(ggml_mul(ctx,z,w.ffn_norm));
+            auto * z=rnd(ggml_rms_norm(ctx,residual,1e-5f)); z=rnd(ggml_mul(ctx,z,vector_weight(ctx,w.ffn_norm)));
             auto * gate=rnd(ggml_mul_mat(ctx,w.gate,z)); auto * up=rnd(ggml_mul_mat(ctx,w.up,z));
             auto * inner=rnd(ggml_mul(ctx,rnd(ggml_silu(ctx,gate)),up));
             cache->output=rnd(ggml_add(ctx,rnd(ggml_mul_mat(ctx,w.down,inner)),residual));
             ggml_set_output(cache->output);
             cache->graph=ggml_new_graph(ctx); ggml_build_forward_expand(cache->graph,cache->output);
-            if(!ggml_backend_sched_alloc_graph(cache->runtime.sched.get(),cache->graph)) { error="cannot allocate prefix residual scheduler graph"; return false; }
+            if(!cache->runtime.allocate(cache->graph)) { error="cannot allocate prefix residual scheduler graph"; return false; }
             cache->n=n; state->residual[l]=std::move(cache);
         }
         auto & residual=*state->residual[l];
         ggml_backend_tensor_set(residual.input,hidden.data(),0,hidden.size()*sizeof(float));
         ggml_backend_tensor_set(residual.input2,attn.data(),0,attn.size()*sizeof(float));
-        if(ggml_backend_sched_graph_compute(residual.runtime.sched.get(),residual.graph)!=GGML_STATUS_SUCCESS) {
+        if(residual.runtime.compute(residual.graph)!=GGML_STATUS_SUCCESS) {
             state->residual[l].reset(); error="prefix residual graph failed"; return false;
         }
         ggml_backend_tensor_get(residual.output,hidden.data(),0,hidden.size()*sizeof(float));

@@ -1,7 +1,76 @@
 llama_add_compile_flags()
 
+add_executable(test-smolvla-backend-defaults test_smolvla_backend_defaults.cpp)
+target_link_libraries(test-smolvla-backend-defaults PRIVATE llama)
+if (GGML_CUDA)
+    set(SMOLVLA_EXPECTED_BACKEND cuda)
+else()
+    set(SMOLVLA_EXPECTED_BACKEND cpu)
+endif()
+foreach(selection IN ITEMS default cpu cuda invalid)
+    set(expected ${selection})
+    set(override)
+    if (selection STREQUAL "default")
+        set(expected ${SMOLVLA_EXPECTED_BACKEND})
+    else()
+        set(override "SMOLVLA_BACKEND=${selection}")
+        if (selection STREQUAL "invalid")
+            set(expected error)
+        endif()
+    endif()
+    add_test(NAME test-smolvla-backend-${selection}
+        COMMAND ${CMAKE_COMMAND} -E env --unset=SMOLVLA_BACKEND --unset=SMOLVLA_DEVICE
+        ${override} $<TARGET_FILE:test-smolvla-backend-defaults> ${SMOLVLA_EXPECTED_BACKEND} ${expected})
+endforeach()
+add_test(NAME test-smolvla-backend-empty-device
+    COMMAND ${CMAKE_COMMAND} -E env --unset=SMOLVLA_BACKEND SMOLVLA_DEVICE=
+    $<TARGET_FILE:test-smolvla-backend-defaults> ${SMOLVLA_EXPECTED_BACKEND} error)
+
 if (TARGET test-smolvla-graph-reuse)
     add_test(NAME test-smolvla-graph-reuse COMMAND $<TARGET_FILE:test-smolvla-graph-reuse>)
+endif()
+
+if (GGML_CUDA AND TARGET ggml-cuda)
+    add_executable(test-smolvla-bf16-round test_smolvla_bf16_round.cpp)
+    target_link_libraries(test-smolvla-bf16-round PRIVATE ggml ggml-cuda)
+    add_test(NAME test-smolvla-bf16-round COMMAND $<TARGET_FILE:test-smolvla-bf16-round>)
+    set_tests_properties(test-smolvla-bf16-round PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(test-smolvla-vision-softmax test_smolvla_vision_softmax.cpp)
+    target_link_libraries(test-smolvla-vision-softmax PRIVATE ggml ggml-cuda)
+    add_test(NAME test-smolvla-vision-softmax COMMAND $<TARGET_FILE:test-smolvla-vision-softmax>)
+    set_tests_properties(test-smolvla-vision-softmax PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+if (TARGET jetson_pi_smolvla_input)
+    add_executable(test-smolvla-preprocess test_smolvla_preprocess.cpp)
+    target_link_libraries(test-smolvla-preprocess PRIVATE jetson_pi_smolvla_input)
+    add_test(NAME test-smolvla-preprocess COMMAND $<TARGET_FILE:test-smolvla-preprocess>)
+endif()
+
+if (TARGET jetson_pi_smolvla_action_input)
+    add_executable(test-smolvla-prefix-reuse test_smolvla_prefix_reuse.cpp)
+    target_link_libraries(test-smolvla-prefix-reuse PRIVATE jetson_pi_smolvla_action_input)
+    add_test(NAME test-smolvla-prefix-reuse COMMAND $<TARGET_FILE:test-smolvla-prefix-reuse>)
+    set_tests_properties(test-smolvla-prefix-reuse PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(test-smolvla-sample-reuse test_smolvla_sample_reuse.cpp)
+    target_link_libraries(test-smolvla-sample-reuse PRIVATE jetson_pi_smolvla_action_input)
+    add_test(NAME test-smolvla-sample-reuse COMMAND $<TARGET_FILE:test-smolvla-sample-reuse>)
+    set_tests_properties(test-smolvla-sample-reuse PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+if (TARGET jetson_pi_smolvla_policy)
+    add_executable(test-smolvla-vision-reuse test_smolvla_vision_reuse.cpp)
+    target_link_libraries(test-smolvla-vision-reuse PRIVATE jetson_pi_smolvla_policy)
+    add_test(NAME test-smolvla-vision-reuse COMMAND $<TARGET_FILE:test-smolvla-vision-reuse>)
+    set_tests_properties(test-smolvla-vision-reuse PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(test-smolvla-policy-reuse test_smolvla_policy_reuse.cpp)
+    target_link_libraries(test-smolvla-policy-reuse PRIVATE jetson_pi_smolvla_policy)
+    add_test(NAME test-smolvla-policy-reuse COMMAND $<TARGET_FILE:test-smolvla-policy-reuse>)
+    # Run manually with local MODEL.gguf and MMPROJ.gguf paths; never download fixtures.
+    set_tests_properties(test-smolvla-policy-reuse PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 function(llama_build source)

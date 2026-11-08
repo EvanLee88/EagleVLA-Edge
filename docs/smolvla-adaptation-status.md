@@ -1,8 +1,10 @@
 # SmolVLA 适配状态与检查点调查
 
-**状态：CPU 策略已接入现有 foreground HTTP 服务。** 输入状态和输出动作均处于归一化空间，具体机器人需要匹配的统计信息。
+**状态：CPU / CUDA 策略已接入现有 foreground HTTP 服务，默认 backend 跟随构建：CUDA-enabled 默认 CUDA，CPU-only 默认 CPU。** 输入状态和输出动作均处于归一化空间，具体机器人需要匹配的统计信息。
 
-专用模型加载器及 CPU 前缀、动作专家和投影实现位于 `src/models/smolvla.cpp`；预处理、视觉和策略编排保留在 `src/jetson_pi_smolvla.cpp`。策略通过专用 llama 模型加载器加载并持有前缀及专家权重，计算图借用这些 CPU 权重，并使用独立的 ggml CPU backend scheduler 执行；处理器统计不作为模型权重加载。运行时会拒绝不支持的策略配置。此实现按阶段建立多个图，并复用 scheduler、已分配计算图及输入输出 buffer；prefix 长度等图形状变化时重新构建。中间结果和 KV 仍经 host 传递，不使用 `llama_context` 自身的 scheduler，也未实现 GPU 路径；普通 Llama graph 不是完整的 SmolVLA 策略图。同一个 policy 实例不可并发调用。独立 reference 工具仍可直接从 GGUF 加载权重。
+专用模型加载器、前缀、动作专家和投影实现位于 `src/models/smolvla.cpp`；预处理、视觉和策略编排保留在 `src/jetson_pi_smolvla.cpp`。策略通过专用 llama 模型加载器加载并持有所选设备上的前缀及专家权重，计算图借用这些权重，并使用独立的 ggml backend scheduler 执行；处理器统计不作为模型权重加载。运行时会拒绝不支持的策略配置。此实现按阶段建立多个图，并复用 scheduler、已分配计算图及输入输出 buffer；prefix 长度等图形状变化时重新构建。中间结果和 KV 仍经 host 传递，不使用 `llama_context` 自身的 scheduler；普通 Llama graph 不是完整的 SmolVLA 策略图。同一个 policy 实例不可并发调用。独立 reference 工具仍可直接从 GGUF 加载权重。
+
+只需 `-DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON`，不需要 SmolVLA 专用编译选项或 backend 环境变量：库 API、reference CLI 和 server 默认使用 CUDA0，CUDA 默认使用单 Prefix 层常驻图及完整 Expert velocity-step 图（action/time encode、16 层 Expert、最终 norm/velocity）；时间 embedding 与 Euler 保留原 CPU 计算，尚非十步全设备图。`SMOLVLA_EXPERT_STEP=0` 恢复层链对照，`SMOLVLA_EXPERT_CHAIN=0` 优先恢复单层 Expert 常驻对照。严格 CUDA Idefics3 视觉路径默认复用一个固定 512×512 已分配图；每次仍上传新像素并计算三路摄像头，`SMOLVLA_VISION_REUSE=0` 可恢复逐图重建对照，FA 保持关闭，普通 CLIP/CPU 不启用此缓存。视觉、前缀和动作专家图严格分配到 CUDA，不支持的设备/算子直接失败。CPU-only 构建默认 CPU；`SMOLVLA_BACKEND=cpu` 可显式覆盖 CUDA 构建，`SMOLVLA_DEVICE` 可改选 CUDA 设备，`SMOLVLA_PREFIX_RESIDENT=0`、`SMOLVLA_EXPERT_RESIDENT=0` 可分别切回 staged 对照路径。主机仍负责 RGB 预处理、tokenization、阶段间张量传输与采样编排。每次推理打印 ViT、LLM prefix prefill（非自回归 decode）和全部十步 action expert 的同步阶段耗时，HTTP 同时返回 `timing_breakdown_ms`。详见 [CUDA 分阶段 profiling](smolvla-cuda-profiling.md)。给定 F16 完整输入迁移检查通过，但短序列合成输入的独立组件跨 backend 数值压力测试仍有超差项，不能推断任意输入或所有层逐位等价。
 
 迁移后使用 `py312` 中的 LeRobot 从 `../models/smolvla_base` 重新生成固定参考数据，对照已有 F32 GGUF：完整策略最大绝对误差为 `0.019934118`、余弦相似度为 `0.999987921`，通过现有验证阈值。该结果仅覆盖固定 CPU 输入，动作仍处于归一化空间。
 

@@ -51,7 +51,7 @@ struct soft_max_params {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template <bool use_shared, int ncols_template, int block_size_template, typename T>
+template <bool use_shared, int ncols_template, int block_size_template, typename T, bool use_register = false>
 static __global__ void soft_max_f32(
         const float * x, const T * mask, const float * sinks, float * dst, const soft_max_params p) {
     const int ncols = ncols_template == 0 ? p.ncols : ncols_template;
@@ -81,6 +81,10 @@ static __global__ void soft_max_f32(
     float * buf_iw = data_soft_max_f32; // shared memory buffer for inter-warp communication
     // shared memory buffer to cache values between iterations:
     float * vals = use_shared ? buf_iw + WARP_SIZE : dst;
+    // Exactly one column per thread: retain both score and exponential in a register.
+    static_assert(!use_register || (use_shared && ncols_template == 1024 && block_size_template == 1024 &&
+                                   std::is_same_v<T, float>));
+    float register_val = 0.0f;
 
     float max_val = sinks ? sinks[i02] : -INFINITY;
 
@@ -94,7 +98,11 @@ static __global__ void soft_max_f32(
 
         const float val = x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
 
-        vals[col] = val;
+        if constexpr (use_register) {
+            register_val = val;
+        } else {
+            vals[col] = val;
+        }
         max_val = max(max_val, val);
     }
 
@@ -111,9 +119,13 @@ static __global__ void soft_max_f32(
             break;
         }
 
-        const float val = expf(vals[col] - max_val);
+        const float val = expf((use_register ? register_val : vals[col]) - max_val);
         tmp += val;
-        vals[col] = val;
+        if constexpr (use_register) {
+            register_val = val;
+        } else {
+            vals[col] = val;
+        }
     }
 
     // find the sum of exps in the block
@@ -133,7 +145,7 @@ static __global__ void soft_max_f32(
             return;
         }
 
-        dst[col] = vals[col] * inv_sum;
+        dst[col] = (use_register ? register_val : vals[col]) * inv_sum;
     }
 }
 
@@ -281,6 +293,17 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
         constexpr int block = (ncols > 1024 ? 1024 : ncols);
 
         if (p.ncols == ncols) {
+#ifndef GGML_USE_HIP
+            if constexpr (ncols == 1024 && std::is_same_v<T, float>) {
+                // Orin vision attention only; all other invocations retain the original kernel.
+                if (ggml_cuda_info().devices[id].cc == 870 && mask == nullptr && sinks == nullptr &&
+                    p.max_bias == 0.0f && p.ne01 == 1024 && p.ne02 == 12 && p.ne03 == 1) {
+                    soft_max_f32<true, ncols, block, T, true>
+                        <<<block_nums, block_dims, WARP_SIZE * sizeof(float), stream>>>(x, mask, sinks, dst, p);
+                    return true;
+                }
+            }
+#endif
             CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, ncols, block, T>), smpbo);
             soft_max_f32<true, ncols, block><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, mask, sinks, dst, p);

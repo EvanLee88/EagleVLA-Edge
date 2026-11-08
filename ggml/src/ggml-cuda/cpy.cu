@@ -5,6 +5,27 @@
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
 
+// Keep both conversions identical to the contiguous CPY kernels. In particular,
+// a float bit-mask or host BF16 conversion has different CUDA NaN semantics.
+static __global__ void cpy_f32_bf16_f32(const float * src, float * dst, const int64_t ne) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    dst[i] = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(src[i]));
+}
+
+void ggml_cuda_cpy_f32_bf16_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+    const int64_t ne = ggml_nelements(src);
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(cpy_f32_bf16_f32, launch_params, (const float *) src->data, (float *) dst->data, ne);
+}
+
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks

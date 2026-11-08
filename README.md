@@ -23,7 +23,7 @@
     <a href="#real-world-demo">Demo</a> ·
     <a href="#quick-start">Quick Start</a> ·
     <a href="#gr00t-n17-c-api-and-server">GR00T APIs</a> ·
-    <a href="#smolvla-foreground-server-cpu">SmolVLA</a> ·
+    <a href="#smolvla-foreground-server-cpu--cuda">SmolVLA</a> ·
     <a href="#performance-on-rtx-4090-jetson-orin-and-thor">Performance</a> ·
     <a href="docs/model_conversion.md">Model Conversion</a> ·
     <a href="docs/foreground_server_usage.md">Server API</a> ·
@@ -72,7 +72,7 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 - ✅ **PI0** - PI-specific multimodal preprocessing, language backbone, action expert, and continuous action-chunk generation.
 - ✅ **PI0.5** - two-view prefix construction, PI0.5 prompt/state handling, and 10-step action generation.
 - ✅ **NVIDIA Isaac GR00T N1.7** - Qwen3-VL multimodal backbone, complete GR00T Action Head, four-step flow matching, and `[40, 132]` action generation.
-- ✅ **SmolVLA** - CPU foreground inference with a SmolVLM2 backbone and continuous `[50, 6]` action chunks for the base checkpoint.
+- ✅ **SmolVLA** - CPU/CUDA foreground inference with a SmolVLM2 backbone and continuous `[50, 6]` action chunks for the base checkpoint; CUDA builds use CUDA by default.
 - ✅ **Automatic model dispatch** - detect PI0, PI0.5, GR00T N1.7, and SmolVLA from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override for PI models.
 
 ### Runtime Optimizations
@@ -88,7 +88,8 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 - ✅ **GR00T C API** - accept raw multi-camera RGB, instruction, normalized state, and embodiment ID through `libjetson_pi_gr00t`.
 
 The foreground HTTP server supports PI0, PI0.5, GR00T N1.7, and SmolVLA.
-SmolVLA uses the CPU path described below. The in-process Python API and FlashRT
+SmolVLA defaults to CUDA in CUDA-enabled builds and CPU otherwise, as described below.
+The in-process Python API and FlashRT
 provider remain specific to PI0 and PI0.5; GR00T also has a standalone C API.
 
 ### Planned Model Support
@@ -140,6 +141,13 @@ NVIDIA Jetson or another CUDA-capable target:
 cmake -S . -B build -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-server -j
 ```
+
+SmolVLA follows these same build choices: without the CUDA options it defaults
+to CPU inference; with `GGML_CUDA=ON` and `GGML_CUDA_GRAPHS=ON` it defaults to
+CUDA inference. No SmolVLA-specific build flag or runtime backend variable is
+required. Use fresh/separate build directories for the two configurations:
+CMake caches previous options, so removing `-DGGML_CUDA=ON` from a later command
+does not reset an existing CUDA build to CPU.
 
 For an explicit CUDA target, add `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090,
 `87` for Orin, or `110` for Thor (with a compatible CUDA toolkit).
@@ -402,20 +410,41 @@ order must match the checkpoint's camera/time convention. The managed Python for
 client and FlashRT provider do not yet dispatch GR00T models.
 
 
-## SmolVLA Foreground Server (CPU)
+## SmolVLA Foreground Server (CPU / CUDA)
 
 The SmolVLA base checkpoint accepts three camera images, a language instruction,
 **six already normalized state values**, and returns a normalized `[50, 6]` action
-chunk. The current SmolVLA policy implementation runs on the CPU, including on a
-build that also supports GPUs. It uses the existing foreground endpoints and does
-not require a new Web interface.
+chunk. The default follows the build: `GGML_CUDA=ON` selects CUDA for vision,
+prefix and action expert graphs; a CPU-only build selects CPU. No SmolVLA-specific
+build flag or runtime environment variable is required. Use `SMOLVLA_BACKEND=cpu`
+to override a CUDA build, or `SMOLVLA_DEVICE` to select a device other than `CUDA0`.
+CUDA uses resident Prefix layer graphs and a complete Expert velocity-step graph by default
+(action/time encode, 16 Expert layers, final normalization and velocity projection).
+`SMOLVLA_EXPERT_STEP=0` selects the 16-layer-chain comparison path;
+`SMOLVLA_EXPERT_CHAIN=0` selects single-layer Expert graphs, overriding the step selection.
+`SMOLVLA_PREFIX_RESIDENT=0` and `SMOLVLA_EXPERT_RESIDENT=0` independently
+select their fully staged diagnostic/reference paths. Time embeddings and Euler integration
+remain on the CPU; this is not a full ten-step device graph.
+The strict CUDA Idefics3 path also reuses one allocated vision graph for fixed 512×512
+inputs by default; pixels are uploaded and all three cameras are computed every time.
+`SMOLVLA_VISION_REUSE=0` selects the rebuild-per-image comparison path. CPU and ordinary
+CLIP paths retain their existing behavior; Flash Attention remains disabled for SmolVLA.
+An unavailable CUDA device fails explicitly instead of
+silently falling back to CPU. Preprocessing and staged host transfers remain on
+the CPU. It uses the existing foreground endpoints and does not require a new Web
+interface.
 
-Build the server with the CPU backend enabled and dynamic backend loading disabled:
+Build SmolVLA with the same CPU/CUDA choices as the Quick Start. No additional
+SmolVLA option is needed. Separate fresh directories avoid reusing cached options:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CPU=ON -DGGML_BACKEND_DL=OFF
-cmake --build build --target llama-server -j
+# No CUDA options: SmolVLA defaults to CPU inference.
+cmake -S . -B build-cpu
+cmake --build build-cpu --target llama-server -j
+
+# Add the standard CUDA options: SmolVLA defaults to CUDA inference.
+cmake -S . -B build-cuda -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON
+cmake --build build-cuda --target llama-server -j
 ```
 
 ### Prepare and convert the checkpoint
@@ -486,6 +515,23 @@ statistics mapping for every robot; do not directly send normalized outputs to a
 robot. By default the server samples random noise. For repeatable comparisons, set
 `SMOLVLA_ACTION_NOISE_BIN` before startup to a file containing exactly `50×32`
 float32 values.
+
+With `-DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON`, rebuild and run the server normally;
+SmolVLA defaults to CUDA without `SMOLVLA_BACKEND` or `SMOLVLA_EXPERT_RESIDENT`.
+An explicit architecture (e.g. `-DCMAKE_CUDA_ARCHITECTURES=87` for Orin) is only
+needed when native architecture detection is unsuitable, such as cross-compiling.
+The dedicated policy selects its backend independently of the generic server's
+`-ngl` setting. For a CPU-only build, omit the CUDA options in a fresh build
+directory. If reusing a previously configured CUDA directory, explicitly reset
+`-DGGML_CUDA=OFF` or use a new directory; merely omitting the options retains
+CMake's cached CUDA setting. `SMOLVLA_BACKEND=cpu` is an optional runtime override
+for a CUDA build, not a requirement for the normal CPU build.
+
+Successful inference prints `vit_ms`, `llm_prefill_ms` and `action_expert_ms`, also
+returned in `timing_breakdown_ms` alongside preparation and total times. The LLM
+stage is prefix prefill, not autoregressive decode; action expert timing covers
+all ten sampling steps. See [CUDA stage profiling](docs/smolvla-cuda-profiling.md)
+for timing scopes, repeatable benchmarks, and known numerical limitations.
 
 See [SmolVLA conversion and usage](docs/smolvla-adaptation-status.md) for details
 and [CPU HTTP comparison against LeRobot](docs/smolvla-cpu-comparison.md) for
@@ -769,7 +815,9 @@ See the [FlashRT repository](https://github.com/flashrt-project/FlashRT) for ins
 |---|---|
 | [Model Preparation](docs/model_conversion.md) | Download, split, and convert PI checkpoints to GGUF. |
 | [GR00T Validation and Conversion](tools/gr00t-reference/README.md) | Convert GR00T N1.7 to GGUF and run reference and regression utilities. |
-| [SmolVLA Conversion and Usage](docs/smolvla-adaptation-status.md) | Convert SmolVLA and use the CPU foreground server. |
+| [SmolVLA Conversion and Usage](docs/smolvla-adaptation-status.md) | Convert SmolVLA and use the CPU/CUDA foreground server. |
+| [SmolVLA CUDA Profiling](docs/smolvla-cuda-profiling.md) | Completed stage timings, validation boundaries, and measured baselines. |
+| [SmolVLA CUDA Optimization](docs/smolvla-cuda-optimization-plan.md) | Staged optimization plan, correctness gates, and execution results. |
 | [SmolVLA CPU Comparison](docs/smolvla-cpu-comparison.md) | Compare foreground HTTP actions with LeRobot. |
 | [In-process NumPy API](docs/python_api.md) | Direct pybind11 PI0/PI0.5 inference without a server or FlashRT. |
 | [Foreground Server API](docs/foreground_server_usage.md) | Session lifecycle, endpoints, response fields, and operational notes. |

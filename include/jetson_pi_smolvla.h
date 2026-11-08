@@ -1,6 +1,6 @@
 #pragma once
 
-// SmolVLA tokenizer and CPU policy interfaces.
+// SmolVLA tokenizer and policy interfaces.
 
 #include "llama.h"
 #include <stddef.h>
@@ -28,6 +28,19 @@ LLAMA_API int32_t smolvla_tokenizer_encode(const struct smolvla_tokenizer * toke
 #include <cstdint>
 #include <string>
 #include <vector>
+
+enum class smolvla_backend { cpu, cuda };
+// Defined by the linked library's build: CUDA when GGML_CUDA=ON, otherwise CPU.
+// Keep this out of header conditionals so external consumers share the same default.
+LLAMA_API smolvla_backend smolvla_default_backend();
+struct smolvla_backend_options {
+    smolvla_backend backend = smolvla_default_backend();
+    std::string device = "CUDA0";
+};
+
+// Parse optional runtime overrides; unset variables preserve the build default.
+// Library open() defaults follow the build, without reading environment variables.
+LLAMA_API bool smolvla_backend_options_from_env(smolvla_backend_options & options, std::string & error);
 
 namespace smolvla_input {
 
@@ -87,9 +100,9 @@ bool euler_integrate(const std::vector<float> & noise, int num_steps, const velo
 // Action input and output projections; attention expert execution is separate.
 class smolvla_action_input {
 public:
-    static std::unique_ptr<smolvla_action_input> open(const char * path, int threads, std::string & error);
-    // The caller keeps the CPU llama model alive for the lifetime of this object.
-    static std::unique_ptr<smolvla_action_input> open(const llama_model * model, int threads, std::string & error);
+    static std::unique_ptr<smolvla_action_input> open(const char * path, int threads, std::string & error, const smolvla_backend_options & backend = {});
+    // The caller keeps the selected-backend llama model alive for the lifetime of this object.
+    static std::unique_ptr<smolvla_action_input> open(const llama_model * model, int threads, std::string & error, const smolvla_backend_options & backend = {});
     ~smolvla_action_input();
     smolvla_action_input(const smolvla_action_input &) = delete;
     smolvla_action_input & operator=(const smolvla_action_input &) = delete;
@@ -102,6 +115,7 @@ public:
     // Project 50 x 720 final expert outputs into 50 x 32 velocity values.
     bool project_velocity(const float * expert_output, std::vector<float> & velocity, std::string & error);
 private:
+    friend class smolvla_expert;
     smolvla_action_input();
     struct impl;
     std::unique_ptr<impl> state;
@@ -120,7 +134,7 @@ namespace smolvla {
 // use the existing llama.cpp interleaved layout instead.
 bool expert_rope(const float * input, size_t tokens, size_t heads,
                  const int32_t * positions, int threads,
-                 std::vector<float> & output, std::string & error);
+                 std::vector<float> & output, std::string & error, const smolvla_backend_options & backend = {});
 }
 
 
@@ -136,7 +150,7 @@ namespace smolvla {
 bool attention(const float * query, const float * key, const float * value,
                size_t query_count, size_t key_count, const uint8_t * mask,
                int threads, std::vector<float> & output, std::string & error,
-               bool bf16_probabilities = false);
+               bool bf16_probabilities = false, const smolvla_backend_options & backend = {});
 }
 
 
@@ -149,9 +163,9 @@ bool attention(const float * query, const float * key, const float * value,
 // Single SmolVLA expert MLP, for incremental runtime validation.
 class smolvla_expert_mlp {
 public:
-    static std::unique_ptr<smolvla_expert_mlp> open(const char * model, int layer, int threads, std::string & error);
-    // The caller keeps the CPU llama model alive for the lifetime of this object.
-    static std::unique_ptr<smolvla_expert_mlp> open(const llama_model * model, int layer, int threads, std::string & error);
+    static std::unique_ptr<smolvla_expert_mlp> open(const char * model, int layer, int threads, std::string & error, const smolvla_backend_options & backend = {});
+    // The caller keeps the selected-backend llama model alive for the lifetime of this object.
+    static std::unique_ptr<smolvla_expert_mlp> open(const llama_model * model, int layer, int threads, std::string & error, const smolvla_backend_options & backend = {});
     ~smolvla_expert_mlp();
     smolvla_expert_mlp(const smolvla_expert_mlp &) = delete;
     smolvla_expert_mlp & operator=(const smolvla_expert_mlp &) = delete;
@@ -170,6 +184,19 @@ public:
     // Input/output: 50 tokens of 720 elements. Input is already normalized.
     bool run(const float * input, std::vector<float> & output, std::string & error);
 private:
+    friend class smolvla_expert;
+    struct sample_workspace;
+    bool prepare_cross_kv(const float * cache_k, const float * cache_v, size_t tokens,
+                          sample_workspace & workspace, std::string & error);
+    bool project_qkv_impl(const float * hidden, const float * cache_k, const float * cache_v,
+                          size_t cache_tokens, std::vector<float> & q, std::vector<float> & k,
+                          std::vector<float> & v, std::string & error, sample_workspace * workspace);
+    bool forward_resident(const float * hidden, const float * prefix_k, const float * prefix_v,
+                          size_t prefix_tokens, std::vector<float> & output,
+                          std::string & error, sample_workspace & workspace);
+    bool forward_impl(const float * hidden, const float * prefix_k, const float * prefix_v,
+                      const std::vector<uint8_t> & prefix_valid, std::vector<float> & output,
+                      std::string & error, sample_workspace * workspace);
     smolvla_expert_mlp();
     struct impl;
     std::unique_ptr<impl> state;
@@ -182,13 +209,13 @@ private:
 #include <string>
 #include <vector>
 
-// CPU-only action expert for the smolvla_base architecture.
+// Action expert for the smolvla_base architecture.
 // Cache vectors contain one [prefix_tokens, 5, 64] tensor per layer.
 class smolvla_expert {
 public:
-    static std::unique_ptr<smolvla_expert> open(const char * path, int threads, std::string & error);
-    // The caller keeps the CPU llama model alive for the lifetime of this object.
-    static std::unique_ptr<smolvla_expert> open(const llama_model * model, int threads, std::string & error);
+    static std::unique_ptr<smolvla_expert> open(const char * path, int threads, std::string & error, const smolvla_backend_options & backend = {});
+    // The caller keeps the selected-backend llama model alive for the lifetime of this object.
+    static std::unique_ptr<smolvla_expert> open(const llama_model * model, int threads, std::string & error, const smolvla_backend_options & backend = {});
     ~smolvla_expert();
     smolvla_expert(const smolvla_expert &) = delete;
     smolvla_expert & operator=(const smolvla_expert &) = delete;
@@ -214,12 +241,12 @@ private:
 #include <string>
 #include <vector>
 
-// CPU implementation of the 16-layer SmolVLA VLM prefix.
+// Implementation of the 16-layer SmolVLA VLM prefix.
 class smolvla_prefix {
 public:
-    static std::unique_ptr<smolvla_prefix> open(const char * path, int threads, std::string & error);
-    // The caller keeps the CPU llama model alive for the lifetime of this object.
-    static std::unique_ptr<smolvla_prefix> open(const llama_model * model, int threads, std::string & error);
+    static std::unique_ptr<smolvla_prefix> open(const char * path, int threads, std::string & error, const smolvla_backend_options & backend = {});
+    // The caller keeps the selected-backend llama model alive for the lifetime of this object.
+    static std::unique_ptr<smolvla_prefix> open(const llama_model * model, int threads, std::string & error, const smolvla_backend_options & backend = {});
     ~smolvla_prefix();
     smolvla_prefix(const smolvla_prefix &) = delete;
     smolvla_prefix & operator=(const smolvla_prefix &) = delete;
@@ -254,7 +281,7 @@ private:
 // SmolVLA image embeddings only; this does not run the action policy.
 class smolvla_vision {
 public:
-    static std::unique_ptr<smolvla_vision> open(const char * mmproj_path, int threads, std::string & error);
+    static std::unique_ptr<smolvla_vision> open(const char * mmproj_path, int threads, std::string & error, const smolvla_backend_options & backend = {});
     ~smolvla_vision();
     smolvla_vision(const smolvla_vision &) = delete;
     smolvla_vision & operator=(const smolvla_vision &) = delete;
@@ -278,18 +305,28 @@ private:
 #include <vector>
 
 struct smolvla_rgb_image { const uint8_t * data; int width; int height; };
-// CPU inference for the supplied smolvla_base checkpoint. The caller provides
+// Completed stage wall times, including host work and boundary transfers, in ms.
+struct smolvla_policy_timings {
+    double vit_ms = 0;              // All three image encodes, including preprocessing/projector.
+    double prefix_prepare_ms = 0;   // State projection and prefix assembly.
+    double llm_prefill_ms = 0;      // Prefix KV computation, not autoregressive decoding.
+    double action_expert_ms = 0;    // All ten sampling steps, projections and integration.
+    double total_ms = 0;            // Full infer(), excluding model loading.
+};
+// Inference for the supplied smolvla_base checkpoint. The caller provides
 // normalized state and deterministic initial noise; actions are normalized.
 // Instances contain mutable graph caches and must not be used concurrently.
 class smolvla_policy {
 public:
-    static std::unique_ptr<smolvla_policy> open(const char * model, const char * mmproj, int threads, std::string & error);
+    static std::unique_ptr<smolvla_policy> open(const char * model, const char * mmproj, int threads, std::string & error, const smolvla_backend_options & backend = {});
     ~smolvla_policy();
     smolvla_policy(const smolvla_policy &) = delete;
     smolvla_policy & operator=(const smolvla_policy &) = delete;
+    // Optional timings are cleared on entry and populated only on success.
     bool infer(const std::vector<smolvla_rgb_image> & images, const std::string & instruction,
                const std::vector<float> & normalized_state, const std::vector<float> & noise,
-               std::vector<float> & normalized_actions, std::string & error);
+               std::vector<float> & normalized_actions, std::string & error,
+               smolvla_policy_timings * timings = nullptr);
 private:
     smolvla_policy();
     struct impl;
